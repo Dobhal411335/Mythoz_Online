@@ -1,0 +1,796 @@
+import mongoose from "mongoose";
+import Order from "@/models/Order";
+import Table from "@/models/floor/Table";
+import TableSession from "@/models/floor/TableSession";
+import Employee from "@/models/employee/Employee";
+import EmployeeLog from "@/models/employee/EmployeeLog";
+import EmployeeShift from "@/models/employee/EmployeeShift";
+import Restaurant from "@/models/Restaurant";
+import Giftcard from "@/models/menu/Giftcard";
+import { buildWorkingHoursSummaryPipeline } from "@/lib/payEstimate";
+import { ACTIVE_ORDER_FILTER } from "@/lib/orders/activeOrderFilter";
+import { toActiveOrderReportView } from "@/lib/orders/orderDeleteEligibility";
+import { paidRevenueOrderMatch } from "@/lib/reports/financial/match";
+import { getItemLineTotal } from "@/utils/productChoices";
+import { businessDayOrderTimeClause } from "@/lib/public/offerFulfillment";
+import {
+  businessCalendarDate,
+  businessDateBounds,
+  formatEmployeeName,
+  paymentTypeContributions,
+  priorBusinessDate,
+  r2,
+  resolveCashTipAmount,
+  resolveTenders,
+} from "./eodHelpers.js";
+import { reconcileEod } from "./reconcileEod.js";
+
+const ORDER_SOURCES = ["POS", "WALK_IN", "STAFF", "ONLINE"];
+
+function normalizeOrderSource(order) {
+  const raw = String(order?.source || "POS").toUpperCase();
+  if (ORDER_SOURCES.includes(raw)) return raw;
+  return "POS";
+}
+
+function sourceSectionName(source) {
+  if (source === "TAKEAWAY") return "Takeaway";
+  if (source === "STAFF") return "Staff";
+  if (source === "ONLINE") return "Online";
+  return null;
+}
+
+/**
+ * Build full End-of-Day report payload for a restaurant + YYYY-MM-DD.
+ */
+export async function buildEodReport({
+  restaurantId,
+  businessDate,
+  actualDeposit = null,
+  generatedBy = null,
+  generatedByName = null,
+}) {
+  const restaurant = await Restaurant.findById(restaurantId)
+    .select("name email phone address")
+    .lean();
+  if (!restaurant) {
+    throw new Error("Restaurant not found");
+  }
+
+  const { start, end } = businessDateBounds(businessDate);
+  const calendarDate = businessCalendarDate(businessDate);
+  const priorDate = priorBusinessDate(businessDate);
+  const rid = new mongoose.Types.ObjectId(String(restaurantId));
+
+  const [
+    paidOrders,
+    cancelledOrders,
+    tables,
+    sessions,
+    shifts,
+    laborRows,
+    statusRows,
+    sourceDayRows,
+    issuedGiftCards,
+  ] = await Promise.all([
+      Order.find(
+        paidRevenueOrderMatch({
+          restaurantId: rid,
+          start,
+          end,
+          businessDate,
+        })
+      )
+        .populate("processedBy", "firstName lastName name")
+        .populate("table", "section tableNumber")
+        .lean(),
+      Order.find({
+        restaurantId: rid,
+        ...ACTIVE_ORDER_FILTER,
+        status: "CANCELLED",
+        ...businessDayOrderTimeClause(businessDate, start, end),
+      })
+        .select("totalAmount subTotal")
+        .lean(),
+      Table.find({ restaurant: rid }).select("_id section").lean(),
+      TableSession.find({
+        restaurant: rid,
+        openedAt: { $gte: start, $lt: end },
+        status: { $in: ["COMPLETED", "RELEASED"] },
+        closedAt: { $ne: null },
+      })
+        .select("openedAt closedAt guestCount")
+        .lean(),
+      EmployeeShift.find({
+        restaurant: rid,
+        date: calendarDate,
+      })
+        .select("status")
+        .lean(),
+      EmployeeLog.aggregate(
+        buildWorkingHoursSummaryPipeline({
+          restaurant: rid,
+          date: calendarDate,
+        })
+      ),
+      Order.aggregate([
+        {
+          $match: {
+            restaurantId: rid,
+            ...ACTIVE_ORDER_FILTER,
+            ...businessDayOrderTimeClause(businessDate, start, end),
+          },
+        },
+        {
+          $group: {
+            _id: "$status",
+            count: { $sum: 1 },
+            amount: { $sum: { $ifNull: ["$totalAmount", 0] } },
+          },
+        },
+      ]),
+      Order.aggregate([
+        {
+          $match: {
+            restaurantId: rid,
+            ...ACTIVE_ORDER_FILTER,
+            ...businessDayOrderTimeClause(businessDate, start, end),
+          },
+        },
+        {
+          $group: {
+            _id: { $ifNull: ["$source", "POS"] },
+            count: { $sum: 1 },
+            paidCount: {
+              $sum: {
+                $cond: [
+                  {
+                    $and: [
+                      { $not: { $in: ["$status", ["CANCELLED", "WAIVED"]] } },
+                      {
+                        $or: [
+                          { $eq: ["$paymentStatus", "PAID"] },
+                          { $eq: ["$status", "PAID"] },
+                        ],
+                      },
+                    ],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+            amount: { $sum: { $ifNull: ["$totalAmount", 0] } },
+          },
+        },
+      ]),
+      Giftcard.find({
+        restaurant: rid,
+        isIssued: true,
+        $or: [
+          { issueDate: { $gte: start, $lt: end } },
+          {
+            $and: [
+              { $or: [{ issueDate: null }, { issueDate: { $exists: false } }] },
+              { createdAt: { $gte: start, $lt: end } },
+            ],
+          },
+        ],
+      })
+        .select("value")
+        .lean(),
+    ]);
+
+  const tableSectionById = new Map(
+    tables.map((t) => [String(t._id), (t.section || "").trim() || "No Section"])
+  );
+
+  // —— Sales aggregates ——
+  let grossSales = 0;
+  let netSales = 0;
+  let totalDiscounts = 0;
+  let totalSalesTaxes = 0;
+  let totalTips = 0;
+  let totalServiceCharges = 0;
+  let totalGuestCount = 0;
+  let totalCash = 0;
+  let totalNonCash = 0;
+  let totalGiftCardPayments = 0;
+  let totalCashRounding = 0;
+  let billsWithOutstanding = 0;
+
+  const sectionMap = new Map();
+  const categoryMap = new Map();
+  const tipsByEmp = new Map();
+  const paymentTypeMap = new Map();
+  const taxMap = new Map();
+  const sourceMap = new Map(
+    ORDER_SOURCES.map((source) => [
+      source,
+      {
+        source,
+        label:
+          source === "WALK_IN"
+            ? "Takeaway"
+            : source === "STAFF"
+              ? "Staff"
+              : source === "ONLINE"
+                ? "Online"
+                : "POS / Table",
+        billCount: 0,
+        netSales: 0,
+        grossSales: 0,
+        discounts: 0,
+        taxes: 0,
+        tips: 0,
+      },
+    ]),
+  );
+
+  const ensureSection = (name) => {
+    if (!sectionMap.has(name)) {
+      sectionMap.set(name, {
+        sectionName: name,
+        billCount: 0,
+        netSales: 0,
+        grossSales: 0,
+        discounts: 0,
+        taxes: 0,
+      });
+    }
+    return sectionMap.get(name);
+  };
+
+  const ensureCategory = (name) => {
+    if (!categoryMap.has(name)) {
+      categoryMap.set(name, {
+        salesCategory: name,
+        menuItemQuantity: 0,
+        netSales: 0,
+        grossSales: 0,
+        discounts: 0,
+        taxes: 0,
+      });
+    }
+    return categoryMap.get(name);
+  };
+
+  for (const rawOrder of paidOrders) {
+    // Cash seat deletes: report only remaining live tenders/items (no write-off evidence).
+    const order = toActiveOrderReportView(rawOrder);
+    const sub = r2(order.subTotal);
+    const disc = r2(order.discountTotal);
+    const tax = r2(order.taxTotal);
+    const tip = r2(order.tipAmount);
+    const net = r2(sub - disc);
+
+    grossSales = r2(grossSales + sub);
+    netSales = r2(netSales + net);
+    totalDiscounts = r2(totalDiscounts + disc);
+    totalSalesTaxes = r2(totalSalesTaxes + tax);
+    totalTips = r2(totalTips + tip);
+    totalServiceCharges = r2(
+      totalServiceCharges + r2(order.serviceChargeTotal)
+    );
+    if (order.guestCount != null && Number.isFinite(Number(order.guestCount))) {
+      totalGuestCount += Number(order.guestCount);
+    }
+
+    const tenders = resolveTenders(order);
+    totalCash = r2(totalCash + tenders.cash);
+    totalNonCash = r2(totalNonCash + tenders.card + tenders.giftCard);
+    totalGiftCardPayments = r2(totalGiftCardPayments + tenders.giftCard);
+
+    // Section — takeaway / staff / online get named buckets (not "No Section")
+    const orderSource = normalizeOrderSource(order);
+    let sectionName = sourceSectionName(orderSource);
+    if (!sectionName) {
+      sectionName = "No Section";
+      if (order.table?.section) {
+        sectionName = String(order.table.section).trim() || "No Section";
+      } else if (order.table?._id) {
+        sectionName =
+          tableSectionById.get(String(order.table._id)) || "No Section";
+      } else if (order.table) {
+        sectionName =
+          tableSectionById.get(String(order.table)) || "No Section";
+      }
+    }
+    const sec = ensureSection(sectionName);
+    sec.billCount += 1;
+    sec.netSales = r2(sec.netSales + net);
+    sec.grossSales = r2(sec.grossSales + sub);
+    sec.discounts = r2(sec.discounts + disc);
+    sec.taxes = r2(sec.taxes + tax);
+
+    const srcRow = sourceMap.get(orderSource) || sourceMap.get("POS");
+    srcRow.billCount += 1;
+    srcRow.netSales = r2(srcRow.netSales + net);
+    srcRow.grossSales = r2(srcRow.grossSales + sub);
+    srcRow.discounts = r2(srcRow.discounts + disc);
+    srcRow.taxes = r2(srcRow.taxes + tax);
+    srcRow.tips = r2(srcRow.tips + tip);
+
+    // Categories — allocate order discount/tax proportionally by item line net
+    // Line gross includes customExtras (price is base unit only).
+    const items = Array.isArray(order.items) ? order.items : [];
+    const itemGrossTotal = items.reduce(
+      (s, it) => s + getItemLineTotal(it),
+      0
+    );
+    for (const it of items) {
+      const catName = (it.category || "Other").trim() || "Other";
+      const lineGross = r2(getItemLineTotal(it));
+      const share =
+        itemGrossTotal > 0 ? lineGross / itemGrossTotal : 0;
+      const lineDisc = r2(disc * share);
+      const lineTax =
+        it.tax != null
+          ? r2((Number(it.tax) || 0) * (Number(it.qty) || 0))
+          : r2(tax * share);
+      const lineNet = r2(lineGross - lineDisc);
+      const cat = ensureCategory(catName);
+      cat.menuItemQuantity += Number(it.qty) || 0;
+      cat.netSales = r2(cat.netSales + lineNet);
+      cat.grossSales = r2(cat.grossSales + lineGross);
+      cat.discounts = r2(cat.discounts + lineDisc);
+      cat.taxes = r2(cat.taxes + lineTax);
+    }
+
+    // Tips by employee — prefer tipMethod / split tipMethods over paymentMethod
+    const emp = order.processedBy;
+    const empKey = emp?._id ? String(emp._id) : "unknown";
+    const empName = formatEmployeeName(emp);
+    if (!tipsByEmp.has(empKey)) {
+      tipsByEmp.set(empKey, {
+        employeeName: empName,
+        cashTips: 0,
+        nonCashTips: 0,
+        totalTips: 0,
+      });
+    }
+    const tipRow = tipsByEmp.get(empKey);
+    const cashTip = resolveCashTipAmount(order);
+    const nonCashTip = r2(tip - cashTip);
+    tipRow.cashTips = r2(tipRow.cashTips + cashTip);
+    tipRow.nonCashTips = r2(tipRow.nonCashTips + nonCashTip);
+    tipRow.totalTips = r2(tipRow.totalTips + tip);
+
+    // Payment by type — attribute from paymentSplits when present
+    for (const contrib of paymentTypeContributions(order)) {
+      if (!paymentTypeMap.has(contrib.paymentType)) {
+        paymentTypeMap.set(contrib.paymentType, {
+          paymentType: contrib.paymentType,
+          paymentCount: 0,
+          refunds: 0,
+          tips: 0,
+          paymentTotal: 0,
+        });
+      }
+      const pt = paymentTypeMap.get(contrib.paymentType);
+      pt.paymentCount += contrib.paymentCount;
+      pt.tips = r2(pt.tips + contrib.tips);
+      pt.paymentTotal = r2(pt.paymentTotal + contrib.paymentTotal);
+    }
+
+    // Tax breakdown
+    const breakdown = Array.isArray(order.taxBreakdown)
+      ? order.taxBreakdown
+      : [];
+    if (breakdown.length > 0) {
+      for (const t of breakdown) {
+        const name = t.name || "Tax";
+        if (!taxMap.has(name)) {
+          taxMap.set(name, {
+            taxName: name,
+            billCount: 0,
+            taxAmount: 0,
+            netSales: 0,
+            _bills: new Set(),
+          });
+        }
+        const row = taxMap.get(name);
+        row.taxAmount = r2(row.taxAmount + (Number(t.amount) || 0));
+        row.netSales = r2(row.netSales + net);
+        row._bills.add(String(order._id));
+      }
+    } else if (tax > 0) {
+      const name = "Sales Tax";
+      if (!taxMap.has(name)) {
+        taxMap.set(name, {
+          taxName: name,
+          billCount: 0,
+          taxAmount: 0,
+          netSales: 0,
+          _bills: new Set(),
+        });
+      }
+      const row = taxMap.get(name);
+      row.taxAmount = r2(row.taxAmount + tax);
+      row.netSales = r2(row.netSales + net);
+      row._bills.add(String(order._id));
+    }
+  }
+
+  const billCount = paidOrders.length;
+  const totalPayment = r2(totalCash + totalNonCash);
+  const avgPerGuest =
+    totalGuestCount > 0 ? r2(netSales / totalGuestCount) : 0;
+  const avgPerBill = billCount > 0 ? r2(netSales / billCount) : 0;
+
+  // Labor
+  let totalLaborCost = 0;
+  let totalLaborHours = 0;
+  for (const row of laborRows) {
+    totalLaborCost = r2(totalLaborCost + (row.estimatedTotalPay || 0));
+    totalLaborHours = r2(totalLaborHours + (row.totalWorkedHours || 0));
+  }
+  const laborCostPct =
+    netSales > 0 ? r2((totalLaborCost / netSales) * 100) : 0;
+
+  let turnMinutesSum = 0;
+  let turnCount = 0;
+  for (const s of sessions) {
+    if (s.openedAt && s.closedAt) {
+      const mins =
+        (new Date(s.closedAt).getTime() - new Date(s.openedAt).getTime()) /
+        60000;
+      if (mins > 0 && mins < 24 * 60) {
+        turnMinutesSum += mins;
+        turnCount += 1;
+      }
+    }
+  }
+  const avgTableTurn = turnCount > 0 ? r2(turnMinutesSum / turnCount) : 0;
+
+  const totalCashTips = r2(
+    [...tipsByEmp.values()].reduce((s, t) => s + t.cashTips, 0)
+  );
+  const totalNonCashTips = r2(
+    [...tipsByEmp.values()].reduce((s, t) => s + t.nonCashTips, 0)
+  );
+
+  const activeShifts = shifts.filter((s) => s.status === "Active").length;
+  const completedShifts = shifts.filter(
+    (s) => s.status === "Completed"
+  ).length;
+
+  const statusCounts = {
+    total: 0,
+    PENDING: 0,
+    CONFIRMED: 0,
+    COMPLETED: 0,
+    PAID: 0,
+    CANCELLED: 0,
+    WAIVED: 0,
+    open: 0,
+  };
+  const statusAmounts = { CANCELLED: 0, WAIVED: 0 };
+  for (const row of statusRows) {
+    statusCounts.total += row.count;
+    if (Object.prototype.hasOwnProperty.call(statusCounts, row._id)) {
+      statusCounts[row._id] = row.count;
+    }
+    if (row._id === "CANCELLED" || row._id === "WAIVED") {
+      statusAmounts[row._id] = r2(row.amount);
+    }
+  }
+  statusCounts.open = (statusCounts.PENDING || 0) + (statusCounts.CONFIRMED || 0);
+
+  const daySourceCounts = {
+    POS: { count: 0, paidCount: 0, amount: 0 },
+    WALK_IN: { count: 0, paidCount: 0, amount: 0 },
+    STAFF: { count: 0, paidCount: 0, amount: 0 },
+    ONLINE: { count: 0, paidCount: 0, amount: 0 },
+  };
+  for (const row of sourceDayRows) {
+    const key = ORDER_SOURCES.includes(String(row._id || "").toUpperCase())
+      ? String(row._id).toUpperCase()
+      : "POS";
+    daySourceCounts[key].count += row.count || 0;
+    daySourceCounts[key].paidCount += row.paidCount || 0;
+    daySourceCounts[key].amount = r2(
+      daySourceCounts[key].amount + (row.amount || 0),
+    );
+  }
+
+  const issuedGiftCardCount = issuedGiftCards.length;
+  const issuedGiftCardAmount = r2(
+    issuedGiftCards.reduce((s, c) => s + (Number(c.value) || 0), 0)
+  );
+
+  const menuItemCost = 0;
+  const grossMargin = r2(netSales - totalLaborCost - menuItemCost);
+  const totalRefundAmount = 0;
+  const refundsCount = 0;
+  const totalVoids = r2(
+    cancelledOrders.reduce((s, o) => s + (Number(o.totalAmount) || 0), 0)
+  );
+  const giftCardSales = issuedGiftCardAmount;
+  const totalSurcharges = 0;
+  const totalGratuity = 0;
+  const serviceCharges = totalServiceCharges;
+  const otherServiceCharges = 0;
+  const serviceChargesTaxes = 0;
+
+  const paymentsMinusNet = r2(totalPayment - netSales);
+
+  const expectedDeposit = totalCash;
+  const actualDep =
+    actualDeposit != null && actualDeposit !== ""
+      ? r2(actualDeposit)
+      : null;
+  const overShort =
+    actualDep != null ? r2(actualDep - expectedDeposit) : r2(0 - expectedDeposit);
+
+  let generatedByResolved = generatedByName;
+  if (!generatedByResolved && generatedBy) {
+    const emp = await Employee.findById(generatedBy)
+      .select("firstName lastName name")
+      .lean();
+    generatedByResolved = formatEmployeeName(emp);
+  }
+
+  const taxSummaryRows = [...taxMap.values()].map((row) => ({
+    taxName: row.taxName,
+    billCount: row._bills.size,
+    taxAmount: row.taxAmount,
+    netSales: row.netSales,
+  }));
+
+  const tipsByEmployees = [...tipsByEmp.values()].sort((a, b) =>
+    a.employeeName.localeCompare(b.employeeName)
+  );
+
+  const report = {
+    meta: {
+      restaurantName: restaurant.name || "Restaurant",
+      restaurantEmail: restaurant.email || "",
+      restaurantPhone: restaurant.phone || "",
+      restaurantAddress: restaurant.address || "",
+      businessDate,
+      priorDate,
+      title: `${restaurant.name || "Restaurant"} — End of Day — ${businessDate}`,
+      generatedAt: new Date().toISOString(),
+      generatedBy: generatedBy || null,
+      generatedByName: generatedByResolved || null,
+      source: "live",
+    },
+    detailedSalesSummary: {
+      netSales,
+      grossSales,
+      totalDiscounts,
+      menuItemCost,
+      laborCost: totalLaborCost,
+      grossMargin,
+      totalSalesTaxes,
+      totalServiceCharges,
+      averagePerGuest: avgPerGuest,
+      averagePerBill: avgPerBill,
+      totalRefundAmount,
+    },
+    orderCounts: {
+      total: statusCounts.total,
+      paid: billCount,
+      pending: statusCounts.PENDING,
+      confirmed: statusCounts.CONFIRMED,
+      open: statusCounts.open,
+      completed: statusCounts.COMPLETED,
+      cancelled: statusCounts.CANCELLED,
+      cancelledAmount: statusAmounts.CANCELLED,
+      waived: statusCounts.WAIVED,
+      waivedAmount: statusAmounts.WAIVED,
+      refunded: 0,
+      refundedNote: "Refunds are not recorded in the POS yet.",
+      bySource: {
+        pos: daySourceCounts.POS.count,
+        takeAway: daySourceCounts.WALK_IN.count,
+        staff: daySourceCounts.STAFF.count,
+        online: daySourceCounts.ONLINE.count,
+        posPaid: daySourceCounts.POS.paidCount,
+        takeAwayPaid: daySourceCounts.WALK_IN.paidCount,
+        staffPaid: daySourceCounts.STAFF.paidCount,
+        onlinePaid: daySourceCounts.ONLINE.paidCount,
+      },
+    },
+    salesBySource: {
+      rows: ORDER_SOURCES.map((source) => {
+        const paid = sourceMap.get(source);
+        const day = daySourceCounts[source];
+        return {
+          source,
+          label: paid.label,
+          orderCount: day.count,
+          paidCount: paid.billCount,
+          netSales: paid.netSales,
+          grossSales: paid.grossSales,
+          discounts: paid.discounts,
+          taxes: paid.taxes,
+          tips: paid.tips,
+        };
+      }),
+      total: {
+        orderCount: statusCounts.total,
+        paidCount: billCount,
+        netSales,
+        grossSales,
+        discounts: totalDiscounts,
+        taxes: totalSalesTaxes,
+        tips: totalTips,
+      },
+    },
+    detailedLaborSummary: {
+      totalLaborCost,
+      totalLaborHours,
+      laborCostPctOfNetSales: laborCostPct,
+      averageTableTurnTimeMinutes: avgTableTurn,
+      totalNonCashTips,
+      totalCashTips,
+      totalTips,
+      totalGratuity,
+      totalActiveShifts: activeShifts,
+      totalCompletedShifts: completedShifts,
+    },
+    paymentsSummary: {
+      transactionsCount: billCount,
+      refundsCount,
+      totalCash,
+      totalNonCash,
+      totalSurcharges,
+      totalPayment,
+      totalPaymentsMinusNetSales: paymentsMinusNet,
+      totalCashRounding,
+    },
+    salesBySection: {
+      rows: [...sectionMap.values()].sort((a, b) =>
+        a.sectionName.localeCompare(b.sectionName)
+      ),
+      total: {
+        sectionName: "TOTAL",
+        billCount,
+        netSales,
+        grossSales: r2(
+          [...sectionMap.values()].reduce((s, r) => s + r.grossSales, 0)
+        ),
+        discounts: totalDiscounts,
+        taxes: totalSalesTaxes,
+      },
+    },
+    salesBySalesCategory: {
+      rows: [...categoryMap.values()].sort((a, b) =>
+        a.salesCategory.localeCompare(b.salesCategory)
+      ),
+      total: {
+        salesCategory: "TOTAL",
+        menuItemQuantity: [...categoryMap.values()].reduce(
+          (s, r) => s + r.menuItemQuantity,
+          0
+        ),
+        netSales,
+        grossSales: r2(
+          [...categoryMap.values()].reduce((s, r) => s + r.grossSales, 0)
+        ),
+        discounts: totalDiscounts,
+        taxes: totalSalesTaxes,
+      },
+    },
+    giftCardSales: {
+      rows: [
+        {
+          item: "Issued (not POS revenue)",
+          count: issuedGiftCardCount,
+          total: issuedGiftCardAmount,
+        },
+        {
+          item: "Redeemed as payment",
+          count: paidOrders.filter((o) => r2(o.giftcardUsedAmount) > 0).length,
+          total: totalGiftCardPayments,
+        },
+      ],
+      total: {
+        item: "ISSUED TOTAL",
+        count: issuedGiftCardCount,
+        total: issuedGiftCardAmount,
+      },
+      note: "Issued cards are admin stored-value. Redemptions are tenders, not new gift-card revenue.",
+    },
+    tipsByEmployees: {
+      rows: tipsByEmployees,
+      total: {
+        employeeName: "TOTAL",
+        cashTips: totalCashTips,
+        nonCashTips: totalNonCashTips,
+        totalTips,
+      },
+    },
+    tipsSummary: {
+      totalCashTips,
+      totalNonCashTips,
+      totalTips,
+    },
+    paymentByPaymentType: {
+      rows: [...paymentTypeMap.values()].sort((a, b) =>
+        a.paymentType.localeCompare(b.paymentType)
+      ),
+      total: {
+        paymentType: "TOTAL",
+        paymentCount: [...paymentTypeMap.values()].reduce(
+          (s, r) => s + (r.paymentCount || 0),
+          0
+        ),
+        refunds: 0,
+        tips: totalTips,
+        paymentTotal: totalPayment,
+      },
+    },
+    accounts: {
+      rows: [],
+    },
+    tipOuts: {
+      totalCashOwedToHouse: 0,
+      totalCashOwedToServer: 0,
+    },
+    payouts: {
+      totalPayouts: 0,
+    },
+    payins: {
+      totalPayins: 0,
+    },
+    salesTaxAndTipSummary: {
+      netSales,
+      grossSales,
+      totalDiscounts,
+      totalSalesTaxes,
+      totalTips,
+      totalNetSalesTaxesAndTips: r2(
+        netSales + totalSalesTaxes + totalTips + serviceCharges
+      ),
+      serviceCharges,
+      gratuities: totalGratuity,
+      surcharges: totalSurcharges,
+      otherServiceCharges,
+      serviceChargesTaxes,
+      totalRefundsAmount: totalRefundAmount,
+      totalVoids,
+      totalBillCount: billCount,
+      totalGuestCount,
+      giftCardSales,
+      grossMargin,
+      billsWithOutstandingBalance: billsWithOutstanding,
+    },
+    cashDeposit: {
+      businessDay: businessDate,
+      expectedDeposit,
+      actualDeposit: actualDep ?? 0,
+      overShort,
+      createdBy: generatedByResolved || "",
+      openingCashAvailable: false,
+      physicalTillCountAvailable: false,
+      note: "Opening float and physical till count are not recorded. Expected cash is cash tenders from paid orders. Enter an actual deposit to compute over/short.",
+    },
+    taxSummary: {
+      rows: taxSummaryRows,
+      total: {
+        taxName: "TOTAL",
+        billCount: "",
+        taxAmount: totalSalesTaxes,
+        netSales: "",
+      },
+    },
+    summary: {
+      netSales,
+      orders: billCount,
+      taxes: totalSalesTaxes,
+      tips: totalTips,
+      serviceCharges,
+      cash: totalCash,
+      card: r2(totalNonCash - totalGiftCardPayments),
+      giftCard: totalGiftCardPayments,
+      refunds: totalRefundAmount,
+      totalPayment,
+    },
+  };
+
+  report.reconciliation = reconcileEod(report);
+  return report;
+}

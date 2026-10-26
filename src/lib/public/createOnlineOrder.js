@@ -1,0 +1,331 @@
+import Order from "@/models/Order";
+import { repricePosCartItems } from "@/lib/orders/repricePosCartItems";
+import { getNextOrderNumber, getNextInvoiceNumber } from "@/utils/generateOrderNumber";
+import { getSocketServer } from "@/lib/socketServer";
+import { createNotification } from "@/lib/notifications/notificationService";
+import { cartItemsToRepricePayload, normalizeGuestPhone } from "@/lib/public/cartPayload";
+import {
+  formatPickupNotePrefix,
+  formatPickupNotePrefixForDate,
+  isValidPickupForDate,
+  isValidSameDayPickup,
+  parsePickupFromSpecialNote,
+  stripPickupPrefix,
+  onlineOrderingTimezone,
+} from "@/lib/public/pickup";
+import {
+  getTodayRestaurantHours,
+  normalizeRestaurantHours,
+  timeToMinutes,
+} from "@/lib/public/restaurantHours";
+import {
+  cartItemsAreOfferOnly,
+  minOfferValidToDate,
+  probeDateFromISO,
+  toOfferDateOnly,
+} from "@/lib/public/offerFulfillment";
+import { todayBusinessDate } from "@/lib/eod/eodHelpers";
+import CompanyBasicInfo from "@/models/Web/CompanyBasicInfo";
+import { logger } from "@/utils/logger";
+import { sendOnlineOrderStatusEmail } from "@/lib/brevo/sendOnlineOrderStatusEmail";
+
+function pickupOptsFromHours(dayHours) {
+  const closeMin = timeToMinutes(dayHours.close);
+  if (dayHours.is24Hours) {
+    return { is24Hours: true, openMinutes: 0, endMinutes: 23 * 60 + 45 };
+  }
+  return {
+    openMinutes: timeToMinutes(dayHours.open) ?? undefined,
+    endMinutes: closeMin != null ? Math.max(0, closeMin - 15) : undefined,
+  };
+}
+
+export async function quoteOnlineOrder({ restaurantId, items }) {
+  const payload = cartItemsToRepricePayload(items);
+  const priced = await repricePosCartItems({
+    restaurantId,
+    items: payload,
+    discountCode: null,
+    applyServiceCharge: false,
+  });
+
+  return {
+    items: priced.formattedItems,
+    subTotal: priced.subTotal,
+    taxTotal: priced.taxTotal,
+    serviceChargeTotal: priced.serviceChargeTotal || 0,
+    discountTotal: priced.discountTotal || 0,
+    totalAmount: priced.totalAmount,
+  };
+}
+
+export async function createOnlineOrder({
+  restaurantId,
+  restaurantName,
+  restaurantAddress,
+  restaurantPhone = null,
+  restaurantPhoneCode = null,
+  restaurantPhoneDisplay = null,
+  items,
+  partyName,
+  contactNumber,
+  guestCountryCode = "+1",
+  guestEmail = null,
+  pickupTime,
+  customerNote = "",
+  offerFulfillmentDate = null,
+}) {
+  const name = String(partyName || "").trim();
+  if (!name) {
+    const err = new Error("Name is required");
+    err.status = 400;
+    throw err;
+  }
+
+  const phone = normalizeGuestPhone(contactNumber);
+  if (phone.length < 10) {
+    const err = new Error("A valid phone number is required");
+    err.status = 400;
+    throw err;
+  }
+
+  let company = await CompanyBasicInfo.findOne({
+    $or: [{ restaurantId }, { restaurant: restaurantId }],
+  })
+    .sort({ updatedAt: -1 })
+    .lean();
+  if (!company) {
+    company = await CompanyBasicInfo.findOne().sort({ updatedAt: -1 }).lean();
+  }
+
+  const hoursConfig = normalizeRestaurantHours(company?.restaurantHours);
+  const tz = onlineOrderingTimezone();
+  const todayStr = todayBusinessDate(tz);
+  const offerOnly = cartItemsAreOfferOnly(items);
+
+  let fulfillmentDate = null;
+  if (offerOnly) {
+    const requested =
+      toOfferDateOnly(offerFulfillmentDate, tz) || todayStr;
+    const maxDate = minOfferValidToDate(items, tz) || todayStr;
+    if (requested < todayStr) {
+      const err = new Error("Offer date cannot be in the past");
+      err.status = 400;
+      throw err;
+    }
+    if (requested > maxDate) {
+      const err = new Error(
+        "Offer date cannot be after the offer expiry date",
+      );
+      err.status = 400;
+      throw err;
+    }
+    fulfillmentDate = requested;
+  }
+
+  // Use real "now" for today (pastClose / lead slots); probe noon only for future weekdays.
+  const dayProbe =
+    fulfillmentDate && fulfillmentDate !== todayStr
+      ? probeDateFromISO(fulfillmentDate)
+      : new Date();
+  const dayHours = getTodayRestaurantHours(hoursConfig, dayProbe, tz);
+
+  if (dayHours.closed) {
+    const err = new Error(
+      fulfillmentDate && fulfillmentDate !== todayStr
+        ? "Online pickup is closed on the selected offer date"
+        : "Online pickup is closed for today",
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  // Same-day (or non-offer) orders: block after close. Future offer bookings skip this.
+  if (
+    (!fulfillmentDate || fulfillmentDate === todayStr) &&
+    !dayHours.is24Hours &&
+    dayHours.pastClose
+  ) {
+    const err = new Error("Online pickup is closed for today");
+    err.status = 400;
+    throw err;
+  }
+
+  const pickupOpts = pickupOptsFromHours(dayHours);
+
+  let specialNote;
+  if (fulfillmentDate) {
+    if (
+      !isValidPickupForDate(
+        pickupTime,
+        fulfillmentDate,
+        new Date(),
+        tz,
+        pickupOpts,
+      )
+    ) {
+      const err = new Error(
+        fulfillmentDate === todayStr
+          ? "Please choose a valid same-day pickup time"
+          : "Please choose a valid pickup time for the selected offer date",
+      );
+      err.status = 400;
+      throw err;
+    }
+    specialNote = formatPickupNotePrefixForDate(pickupTime, fulfillmentDate);
+  } else {
+    if (!isValidSameDayPickup(pickupTime, new Date(), tz, pickupOpts)) {
+      const err = new Error("Please choose a valid same-day pickup time");
+      err.status = 400;
+      throw err;
+    }
+    specialNote = formatPickupNotePrefix(
+      pickupTime,
+      new Date(),
+      tz,
+      pickupOpts,
+    );
+  }
+
+  const noteBody = String(customerNote || "").trim();
+  if (noteBody) {
+    specialNote = `${specialNote} ${noteBody}`;
+  }
+
+  const priced = await quoteOnlineOrder({ restaurantId, items });
+
+  const orderNumber = await getNextOrderNumber(restaurantId);
+  const invoiceNumber = await getNextInvoiceNumber(restaurantId);
+
+  const order = await Order.create({
+    restaurantId,
+    orderNumber,
+    originalOrderNumber: orderNumber,
+    isActive: true,
+    invoiceNumber,
+    originalInvoiceNumber: invoiceNumber,
+    items: priced.items.map((item) => ({ ...item, sentQty: item.qty })),
+    subTotal: priced.subTotal,
+    taxTotal: priced.taxTotal,
+    serviceChargeTotal: priced.serviceChargeTotal || 0,
+    serviceChargeName: null,
+    discountTotal: priced.discountTotal || 0,
+    discountCode: null,
+    discountPercent: null,
+    totalAmount: priced.totalAmount,
+    specialNote,
+    guestName: name,
+    partyName: name,
+    contactNumber: phone,
+    guestCountryCode: guestCountryCode || "+1",
+    guestEmail: guestEmail ? String(guestEmail).trim().toLowerCase() : null,
+    status: "PENDING",
+    paymentStatus: "UNPAID",
+    source: "ONLINE",
+    offerFulfillmentDate: fulfillmentDate,
+  });
+
+  try {
+    await createNotification({
+      restaurantId,
+      type: "NEW_ORDER",
+      title:
+        fulfillmentDate && fulfillmentDate > todayStr
+          ? "New Upcoming Offer Order"
+          : "New Online Order",
+      message: `Online pickup order #${orderNumber} for ${name}${
+        fulfillmentDate ? ` · ${fulfillmentDate}` : ""
+      }`,
+      orderId: order._id,
+      metadata: {
+        orderNumber,
+        source: "ONLINE",
+        pickupTime,
+        offerFulfillmentDate: fulfillmentDate,
+        actorName: name,
+      },
+    });
+  } catch (notifyErr) {
+    logger.error("Failed to notify online order", notifyErr);
+  }
+
+  try {
+    const io = getSocketServer();
+    if (io) {
+      io.to(`restaurant:${restaurantId}`).emit("order:created", {
+        orderId: order._id,
+        orderNumber: order.orderNumber,
+        source: "ONLINE",
+        offerFulfillmentDate: fulfillmentDate,
+        restaurantName: restaurantName || null,
+      });
+    }
+  } catch (socketErr) {
+    logger.error("Failed to emit online order socket", socketErr);
+  }
+
+  try {
+    await sendOnlineOrderStatusEmail({
+      type: "placed",
+      order,
+      restaurantName,
+      address: restaurantAddress || null,
+      phone: restaurantPhone || null,
+      phoneCode: restaurantPhoneCode || null,
+      phoneDisplay: restaurantPhoneDisplay || null,
+    });
+  } catch (emailErr) {
+    logger.error("Failed to send order-placed email", emailErr);
+  }
+
+  logger.info(`Online order created: ${orderNumber} restaurant=${restaurantId}`);
+
+  return {
+    order,
+    quote: priced,
+    pickup: parsePickupFromSpecialNote(specialNote),
+    customerNote: stripPickupPrefix(specialNote),
+  };
+}
+
+export function serializePublicOrder(order) {
+  if (!order) return null;
+  const specialNote = order.specialNote || "";
+  const pickup = parsePickupFromSpecialNote(specialNote);
+  return {
+    orderNumber: order.orderNumber,
+    status: order.status,
+    paymentStatus: order.paymentStatus,
+    source: order.source,
+    partyName: order.partyName || order.guestName,
+    contactNumber: order.contactNumber,
+    guestEmail: order.guestEmail,
+    subTotal: order.subTotal,
+    taxTotal: order.taxTotal,
+    serviceChargeTotal: order.serviceChargeTotal || 0,
+    discountTotal: order.discountTotal || 0,
+    totalAmount: order.totalAmount,
+    specialNote: stripPickupPrefix(specialNote),
+    pickup,
+    offerFulfillmentDate: order.offerFulfillmentDate || null,
+    orderType: "PICKUP",
+    items: (order.items || []).map((item) => ({
+      name: item.name,
+      qty: item.qty,
+      price: item.price,
+      size: item.size,
+      options: item.options || [],
+      choiceSelections: item.choiceSelections || [],
+      customDataSelections: item.customDataSelections || [],
+      addonChoiceSelections: item.addonChoiceSelections || [],
+      notes: item.notes || "",
+      tax: item.tax || 0,
+      isOffer: Boolean(item.isOffer),
+      inclusions: item.inclusions || [],
+      choices: item.choices || [],
+      drinks: item.drinks || [],
+    })),
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+  };
+}

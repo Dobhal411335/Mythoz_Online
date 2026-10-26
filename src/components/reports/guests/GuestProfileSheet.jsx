@@ -1,0 +1,462 @@
+"use client";
+
+import { ArrowLeft, Mail, Phone, Calendar } from "lucide-react";
+import {
+  Area,
+  AreaChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import OrderDetailBody, {
+  OrderSourceBadge,
+} from "@/components/reports/OrderDetailBody";
+import { PALETTE } from "@/utils/paletteeColor";
+import {
+  dash,
+  formatDate,
+  formatDateTime,
+  formatPhone,
+  guestInitials,
+  guestType,
+  money,
+  STATUS_BADGE,
+} from "./guestFormat";
+
+function paymentMixLabel(row) {
+  const parts = [];
+  if (Number(row.cash) > 0) parts.push(`Cash ${money(row.cash)}`);
+  if (Number(row.card) > 0) parts.push(`Card ${money(row.card)}`);
+  if (Number(row.giftCard) > 0 || Number(row.giftcardUsedAmount) > 0) {
+    parts.push(`Gift ${money(row.giftCard || row.giftcardUsedAmount)}`);
+  }
+  if (parts.length) return parts.join(" · ");
+  return row.paymentLabel || row.paymentMethod || "—";
+}
+
+function GuestProfileSkeleton() {
+  return (
+    <div className="flex flex-col gap-5 pb-6">
+      <div className="flex items-center gap-3">
+        <Skeleton className="w-14 h-14 rounded-full bg-zinc-200 shrink-0" />
+        <div className="flex flex-col gap-2 flex-1">
+          <Skeleton className="h-6 w-40 bg-zinc-200" />
+          <Skeleton className="h-4 w-24 rounded-md bg-zinc-200" />
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-3 bg-zinc-50 p-3 rounded-xl">
+        <div className="flex items-center gap-2">
+          <Skeleton className="h-4 w-4 rounded bg-zinc-200" />
+          <Skeleton className="h-4 w-48 bg-zinc-200" />
+        </div>
+        <div className="flex items-center gap-2">
+          <Skeleton className="h-4 w-4 rounded bg-zinc-200" />
+          <Skeleton className="h-4 w-32 bg-zinc-200" />
+        </div>
+        <div className="flex items-center gap-2">
+          <Skeleton className="h-4 w-4 rounded bg-zinc-200" />
+          <Skeleton className="h-4 w-36 bg-zinc-200" />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <div key={index} className="bg-zinc-50 p-3 rounded-xl flex flex-col gap-2">
+            <Skeleton className="h-3 w-20 bg-zinc-200" />
+            <Skeleton className="h-6 w-16 bg-zinc-200" />
+          </div>
+        ))}
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-3 w-32 bg-zinc-200" />
+        <Skeleton className="h-32 w-full rounded-xl bg-zinc-200" />
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-3 w-36 bg-zinc-200" />
+        <div className="rounded-xl overflow-hidden border border-zinc-100">
+          {Array.from({ length: 3 }).map((_, index) => (
+            <div
+              key={index}
+              className="px-3 py-2 flex items-center justify-between border-b border-zinc-100 last:border-b-0"
+            >
+              <Skeleton className="h-4 w-28 bg-zinc-200" />
+              <Skeleton className="h-5 w-10 rounded bg-zinc-200" />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-3 w-28 bg-zinc-200" />
+        <div className="rounded-xl overflow-hidden border border-zinc-100">
+          {Array.from({ length: 4 }).map((_, index) => (
+            <div
+              key={index}
+              className="px-3 py-2.5 flex flex-col gap-2 border-b border-zinc-100 last:border-b-0"
+            >
+              <div className="flex items-center justify-between">
+                <Skeleton className="h-4 w-24 bg-zinc-200" />
+                <Skeleton className="h-4 w-14 rounded bg-zinc-200" />
+              </div>
+              <div className="flex items-center justify-between">
+                <Skeleton className="h-3 w-32 bg-zinc-200" />
+                <Skeleton className="h-4 w-12 bg-zinc-200" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OrderDetailSkeleton() {
+  return (
+    <div className="flex flex-col gap-4 pb-6">
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-5 w-32 bg-zinc-200" />
+        <Skeleton className="h-3 w-48 bg-zinc-200" />
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <div key={index} className="bg-zinc-50 p-3 rounded-xl flex flex-col gap-2">
+            <Skeleton className="h-3 w-16 bg-zinc-200" />
+            <Skeleton className="h-5 w-20 bg-zinc-200" />
+          </div>
+        ))}
+      </div>
+      <div className="rounded-xl overflow-hidden border border-zinc-100">
+        {Array.from({ length: 5 }).map((_, index) => (
+          <div
+            key={index}
+            className="px-3 py-2.5 flex items-center justify-between border-b border-zinc-100 last:border-b-0"
+          >
+            <Skeleton className="h-4 w-36 bg-zinc-200" />
+            <Skeleton className="h-4 w-12 bg-zinc-200" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ChartTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div className="bg-white border border-zinc-200 rounded-md px-2 py-1 text-xs shadow-sm">
+      <p className="text-zinc-500">{label}</p>
+      <p className="font-semibold text-zinc-900">{money(payload[0].value)}</p>
+    </div>
+  );
+}
+
+function TypeBadge({ type }) {
+  if (type === "returning") {
+    return (
+      <span className="bg-orange-50 text-orange-700 font-semibold text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-md w-max">
+        Returning Guest
+      </span>
+    );
+  }
+  if (type === "takeaway") {
+    return (
+      <span className="bg-zinc-100 text-zinc-600 font-semibold text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-md w-max">
+        Takeaway
+      </span>
+    );
+  }
+  return (
+    <span className="bg-blue-50 text-blue-700 font-semibold text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-md w-max">
+      New Guest
+    </span>
+  );
+}
+
+function GuestProfileBody({
+  guest,
+  history,
+  charts,
+  mostOrderedItems,
+  onSelectOrder,
+}) {
+  const type = guestType(guest);
+  const series = charts?.revenueOverTime || [];
+  const showChart = series.length >= 2 && series.some((row) => Number(row.revenue) > 0);
+  const recent = history.slice(0, 6);
+  const items = mostOrderedItems || [];
+
+  return (
+    <div className="flex flex-col gap-5 pb-6">
+      <div className="flex items-center gap-3">
+        <div className="w-14 h-14 rounded-full bg-orange-100 text-orange-800 flex items-center justify-center text-lg font-semibold shrink-0">
+          {guestInitials(guest.name)}
+        </div>
+        <div className="flex flex-col min-w-0">
+          <h3 className="text-xl font-semibold text-zinc-900 truncate">{guest.name}</h3>
+          <div className="mt-1">
+            <TypeBadge type={type} />
+          </div>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2 bg-zinc-50 p-3 rounded-xl text-sm">
+        <div className="flex items-center gap-2 text-zinc-500">
+          <Mail className="h-4 w-4 shrink-0" />
+          <span className="text-zinc-900 truncate">{dash(guest.email)}</span>
+        </div>
+        <div className="flex items-center gap-2 text-zinc-500">
+          <Phone className="h-4 w-4 shrink-0" />
+          <span className="text-zinc-900">{formatPhone(guest.phone, guest.countryCode)}</span>
+        </div>
+        <div className="flex items-center gap-2 text-zinc-500">
+          <Calendar className="h-4 w-4 shrink-0" />
+          <span className="text-zinc-900">First visit: {formatDate(guest.firstVisit)}</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <div className="bg-zinc-50 p-3 rounded-xl flex flex-col">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+            Lifetime Value
+          </span>
+          <span className="text-lg font-semibold text-orange-600 mt-1 tabular-nums">
+            {money(guest.totalSpent)}
+          </span>
+        </div>
+        <div className="bg-zinc-50 p-3 rounded-xl flex flex-col">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+            Total Orders
+          </span>
+          <span className="text-lg font-semibold text-zinc-900 mt-1 tabular-nums">
+            {guest.orders}
+          </span>
+        </div>
+        <div className="bg-zinc-50 p-3 rounded-xl flex flex-col">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+            Avg Order
+          </span>
+          <span className="text-lg font-semibold text-zinc-900 mt-1 tabular-nums">
+            {money(guest.aov)}
+          </span>
+        </div>
+        <div className="bg-zinc-50 p-3 rounded-xl flex flex-col">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+            Last Visit
+          </span>
+          <span className="text-sm font-semibold text-zinc-900 mt-1">
+            {formatDate(guest.lastVisit)}
+          </span>
+        </div>
+      </div>
+
+      {showChart ? (
+        <div className="flex flex-col gap-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+            Spending over time
+          </span>
+          <div className="h-32">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={series}>
+                <XAxis dataKey="label" tick={{ fontSize: 10, fill: "#71717a" }} hide />
+                <YAxis tick={{ fontSize: 10, fill: "#71717a" }} width={32} />
+                <Tooltip content={<ChartTooltip />} />
+                <Area
+                  type="monotone"
+                  dataKey="revenue"
+                  stroke={PALETTE.accent}
+                  fill="#FFEDD5"
+                  strokeWidth={2}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      ) : null}
+
+      {items.length > 0 ? (
+        <div className="flex flex-col gap-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+            Most ordered items
+          </span>
+          <div className="rounded-xl overflow-hidden border border-zinc-100">
+            {items.map((item) => (
+              <div
+                key={item.name}
+                className="px-3 py-2 flex items-center justify-between bg-white border-b border-zinc-100 last:border-b-0"
+              >
+                <span className="text-sm text-zinc-800 truncate pr-2">{item.name}</span>
+                <span className="text-xs font-semibold tabular-nums text-orange-700 bg-orange-50 px-1.5 py-0.5 rounded">
+                  {item.qty}x
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <div className="flex flex-col gap-2">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+          Recent orders
+        </span>
+        {recent.length === 0 ? (
+          <p className="text-sm text-zinc-500 py-4 text-center">No orders for this guest.</p>
+        ) : (
+          <div className="rounded overflow-hidden border border-zinc-100">
+            {recent.map((row) => (
+              <button
+                key={row.orderId}
+                type="button"
+                onClick={() => onSelectOrder(row.orderId, row)}
+                className="w-full px-3 py-2.5 flex flex-col gap-1.5 bg-white border-b border-zinc-100 text-left hover:bg-orange-200 hover:cursor-pointer"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-sm font-medium text-zinc-900 shrink-0">
+                      {row.orderNumber}
+                    </span>
+                    <OrderSourceBadge order={row} />
+                  </div>
+                  <span
+                    className={`text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded shrink-0 ${
+                      STATUS_BADGE[row.status] || "bg-zinc-100 text-zinc-600"
+                    }`}
+                  >
+                    {row.status}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-zinc-500 gap-2">
+                  <span className="text-xs truncate">
+                    {formatDateTime(row.createdAt)}
+                    {row.tableNo && row.tableNo !== "—" ? ` • Table ${row.tableNo}` : ""}
+                    {row.paymentStatus ? ` • ${row.paymentStatus}` : ""}
+                  </span>
+                  <span className="text-sm font-medium tabular-nums text-zinc-900 shrink-0">
+                    {money(row.totalAmount)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-500">
+                  <span className="truncate">{paymentMixLabel(row)}</span>
+                  <span className="shrink-0 tabular-nums">
+                    {[
+                      Number(row.tipAmount) > 0
+                        ? `Tip ${money(row.tipAmount)}${
+                            row.tipMethod ? ` (${row.tipMethod})` : ""
+                          }`
+                        : null,
+                      Number(row.discountTotal) > 0
+                        ? `Disc ${money(row.discountTotal)}`
+                        : null,
+                      Number(row.serviceChargeTotal) > 0
+                        ? row.serviceChargeName || "Svc"
+                        : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ") || `${row.itemCount || 0} items`}
+                  </span>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function GuestProfileSheet({
+  open,
+  onOpenChange,
+  guest,
+  history,
+  charts,
+  mostOrderedItems,
+  loading,
+  orderDetail,
+  orderLoading,
+  onSelectOrder,
+  onBackToGuest,
+}) {
+  const showingOrder = Boolean(orderDetail) || orderLoading;
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent
+        side="right"
+        className="w-full sm:max-w-[500px] custom-scrollbar p-0 flex flex-col gap-0 overflow-hidden"
+      >
+        <SheetHeader className="bg-zinc-50 px-4 py-3 pr-12 border-b border-zinc-200 text-left space-y-0">
+          {showingOrder ? (
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8 px-2 -ml-2"
+                onClick={onBackToGuest}
+              >
+                <ArrowLeft className="h-4 w-4 mr-1" />
+                Back
+              </Button>
+              <div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <SheetTitle className="text-base truncate">
+                      {orderDetail?.orderNumber || "Order"}
+                    </SheetTitle>
+                    {orderDetail ? <OrderSourceBadge order={orderDetail} /> : null}
+                  </div>
+                  <SheetDescription>Order details</SheetDescription>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <>
+              <SheetTitle className="text-base">Guest Profile</SheetTitle>
+              <SheetDescription className="sr-only">
+                Guest contact, spend, and purchase history
+              </SheetDescription>
+            </>
+          )}
+        </SheetHeader>
+
+        <div
+          key={showingOrder ? "order" : guest?.guestKey || "guest"}
+          className="flex-1 overflow-y-auto px-4 py-4 sheet-body-in"
+        >
+          {showingOrder ? (
+            orderLoading ? (
+              <OrderDetailSkeleton />
+            ) : orderDetail ? (
+              <OrderDetailBody order={orderDetail} />
+            ) : null
+          ) : loading ? (
+            <GuestProfileSkeleton />
+          ) : guest ? (
+            <GuestProfileBody
+              guest={guest}
+              history={history}
+              charts={charts}
+              mostOrderedItems={mostOrderedItems}
+              onSelectOrder={onSelectOrder}
+            />
+          ) : (
+            <GuestProfileSkeleton />
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}

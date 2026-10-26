@@ -1,0 +1,129 @@
+import { withAuth } from "@/utils/auth";
+import Offer from "@/models/menu/Offer";
+import { sendSuccess } from "@/utils/apiResponse";
+import { sendError } from "@/utils/errorHandler";
+import { logger } from "@/utils/logger";
+import Tax from "@/models/tax/Tax";
+import { slugifyOfferName } from "@/utils/offerDetails";
+import { emitMenuStale } from "@/lib/menu/menuStale";
+
+async function ensureUniqueOfferSlug(restaurantId, baseSlug, excludeId = null) {
+  let slug = slugifyOfferName(baseSlug);
+  if (!slug) return "";
+
+  let candidate = slug;
+  let n = 2;
+  while (true) {
+    const query = { restaurant: restaurantId, slug: candidate };
+    if (excludeId) query._id = { $ne: excludeId };
+    const exists = await Offer.exists(query);
+    if (!exists) return candidate;
+    candidate = `${slug}-${n}`;
+    n += 1;
+    if (n > 50) return `${slug}-${Date.now().toString(36)}`;
+  }
+}
+
+// GET - List all offers for the restaurant (POS + admin)
+export const GET = withAuth(async (request) => {
+  try {
+    const { searchParams } = new URL(request.url);
+    const activeOnly =
+      searchParams.get("active") === "1" ||
+      searchParams.get("status") === "Active";
+
+    const query = { restaurant: request.restaurant };
+    if (activeOnly) query.status = true;
+
+    const offers = await Offer.find(query)
+      .sort({ createdAt: -1 })
+      .lean();
+    return sendSuccess(offers, "Offers retrieved successfully");
+  } catch (error) {
+    logger.error("Failed to list offers", error);
+    return sendError(error, "Failed to retrieve offers", 500);
+  }
+}); // any authenticated restaurant user (same as products/heads)
+
+// POST - Create a new promotional offer
+export const POST = withAuth(async (request) => {
+  try {
+    const data = await request.json();
+    const {
+      name,
+      price,
+      description,
+      inclusions,
+      choices,
+      drinks,
+      validFrom,
+      validTo,
+      image,
+      slug,
+    } = data;
+
+    if (!name || price === undefined) {
+      return sendError(new Error("Missing fields"), "Name and Price are required", 400);
+    }
+
+    const resolvedSlug = await ensureUniqueOfferSlug(
+      request.restaurant,
+      slug || name
+    );
+
+    const activeTaxes = await Tax.find({
+      restaurant: request.restaurant,
+      status: "Active",
+    });
+    const taxIds = activeTaxes.map((t) => t._id);
+    let totalPercentage = 0;
+    let totalFixed = 0;
+    const taxNames = [];
+    const taxDetails = [];
+
+    activeTaxes.forEach((t) => {
+      taxNames.push(t.name);
+      taxDetails.push({ name: t.name, value: t.value, type: t.type });
+      if (t.type === "percent" || t.type === "Percent") totalPercentage += t.value;
+      else totalFixed += t.value;
+    });
+
+    const parsedPrice = Number(price) || 0;
+    const computedTotalPrice =
+      parsedPrice + (parsedPrice * totalPercentage) / 100 + totalFixed;
+
+    const newOffer = await Offer.create({
+      restaurant: request.restaurant,
+      name,
+      slug: resolvedSlug,
+      price: parsedPrice,
+      totalPrice: computedTotalPrice,
+      description: description || "",
+      inclusions: inclusions || [],
+      choices: choices || [],
+      drinks: drinks || [],
+      taxes: taxIds,
+      taxData: {
+        totalPercentage,
+        totalFixed,
+        taxNames,
+        taxDetails,
+      },
+      validFrom: validFrom ? new Date(validFrom) : null,
+      validTo: validTo ? new Date(validTo) : null,
+      image: image || {},
+      status: true,
+      createdBy: request.user.id,
+    });
+
+    logger.info(`Offer created: ${name}`);
+    emitMenuStale(request.restaurant);
+    return sendSuccess(newOffer, "Offer created successfully", 201);
+  } catch (error) {
+    if (error?.code === 11000) {
+      return sendError(error, "An offer with this slug already exists", 400);
+    }
+    logger.error("Failed to create offer", error);
+    return sendError(error, "Failed to create offer", 500);
+  }
+}, ["ADMIN", "MANAGER"]);

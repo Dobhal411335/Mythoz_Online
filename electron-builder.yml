@@ -1,0 +1,26 @@
+﻿appId: com.tastybites.pos
+productName: Tasty Bites POS
+electronVersion: "35.0.0"
+directories:
+  output: release
+files:
+  - "electron/**/*"
+  - "package.json"
+extraResources:
+  - from: public/branding/tastybites-sales.png
+    to: icons/POS.png
+mac:
+  target: dmg
+  icon: public/branding/tastybites-sales.png
+win:
+  target: nsis
+  icon: public/branding/tastybites-sales.png
+
+
+
+
+
+
+
+
+

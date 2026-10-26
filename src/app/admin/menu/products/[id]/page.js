@@ -1,0 +1,1549 @@
+"use client";
+
+import React, { useState, useEffect } from "react";
+import Link from "next/link";
+import { useParams, useRouter } from "next/navigation";
+import { ArrowLeft, Plus, Edit, Trash2, Upload, MoreHorizontal, Image as ImageIcon, Trash, Loader2, X } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import { toast } from "sonner";
+import { PALETTE } from "@/utils/paletteeColor";
+import Image from "next/image";
+import AddonChoiceOptionsEditor, {
+  normalizeAddonChoiceOptionsForForm,
+  serializeAddonChoiceOptions,
+} from "@/components/menu/AddonChoiceOptionsEditor";
+
+export default function ProductDetailsConfigPage() {
+  const { id } = useParams();
+  const router = useRouter();
+
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [uploadingSalesImage, setUploadingSalesImage] = useState(false);
+
+  // Product state
+  const [product, setProduct] = useState(null);
+
+  // Table lists
+  const [variants, setVariants] = useState([]);
+  const [addons, setAddons] = useState([]);
+
+  // Form states
+  const [description, setDescription] = useState("");
+  const [taxValue, setTaxValue] = useState("0");
+  const [availableTaxes, setAvailableTaxes] = useState([]);
+  const [selectedTaxes, setSelectedTaxes] = useState([]);
+  const [serviceTax, setServiceTax] = useState(null);
+  const [preparationStyles, setPreparationStyles] = useState([""]);
+  const [productType, setProductType] = useState("");
+  const [customData, setCustomData] = useState([]);
+  const [choiceOptions, setChoiceOptions] = useState([]);
+
+  // Custom selection lists
+  const [sizesList, setSizesList] = useState([]);
+  const [addonsList, setAddonsList] = useState([]);
+  const [ingredientsList, setIngredientsList] = useState([]);
+
+  // Custom Modal states
+  const [isSizeModalOpen, setIsSizeModalOpen] = useState(false);
+  const [isAddonModalOpen, setIsAddonModalOpen] = useState(false);
+  const [isIngredientModalOpen, setIsIngredientModalOpen] = useState(false);
+
+  const [newSizeName, setNewSizeName] = useState("");
+  const [newAddonName, setNewAddonName] = useState("");
+  const [newIngredientName, setNewIngredientName] = useState("");
+
+  const fetchProduct = async () => {
+    try {
+      const res = await fetch(`/api/menu/products/${id}`);
+      const json = await res.json();
+      if (json.success) {
+        const p = json.data;
+        setProduct(p);
+        setDescription(p.description || "");
+        setTaxValue(p.taxValue?.toString() || "0");
+        setVariants(
+          (p.variants || []).map((variant) => ({
+            ...variant,
+            ingredients: Array.isArray(variant.ingredients) ? variant.ingredients : [],
+            choiceOptions: normalizeAddonChoiceOptionsForForm(variant.choiceOptions),
+          }))
+        );
+        setAddons(
+          (p.addons || []).map((addon) => ({
+            ...addon,
+            ingredients: Array.isArray(addon.ingredients) ? addon.ingredients : [],
+            choiceOptions: normalizeAddonChoiceOptionsForForm(addon.choiceOptions),
+          })),
+        );
+        setPreparationStyles(p.preparationStyles?.length ? p.preparationStyles : [""]);
+        setCustomData(
+          p.customData?.length
+            ? p.customData.map((group) => ({
+                name: group.name || "",
+                subChoices: group.subChoices?.length
+                  ? [...group.subChoices]
+                  : ["", ""],
+              }))
+            : []
+        );
+        setChoiceOptions(
+          p.choiceOptions?.length
+            ? p.choiceOptions.map((group) => ({
+                name: group.name || "",
+                subChoices: group.subChoices?.length ? [...group.subChoices] : ["", "", "", ""],
+              }))
+            : []
+        );
+        setProductType(p.productType === "BAR" ? "BAR" : p.productType === "KITCHEN" ? "KITCHEN" : "");
+        setSelectedTaxes(p.taxes?.map(t => typeof t === 'object' ? t._id : t) || []);
+      } else {
+        toast.error("Failed to load product details");
+        router.push("/admin/menu/products");
+      }
+    } catch (e) {
+      toast.error("An error occurred");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchTaxes = async () => {
+    try {
+      const res = await fetch("/api/tax");
+      const json = await res.json();
+      if (json.success) {
+        setAvailableTaxes(json.data);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const fetchServiceTax = async () => {
+    try {
+      const res = await fetch("/api/tax/servicetax?active=1");
+      const json = await res.json();
+      if (json.success) {
+        const list = Array.isArray(json.data) ? json.data : [];
+        setServiceTax(list[0] || null);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const fetchSizes = async () => {
+    try {
+      const res = await fetch("/api/menu/sizes");
+      const json = await res.json();
+      if (json.success) setSizesList(json.data.map(s => s.name));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const fetchAddons = async () => {
+    try {
+      const res = await fetch("/api/menu/addons");
+      const json = await res.json();
+      if (json.success) setAddonsList(json.data.map(a => a.name));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const fetchIngredients = async () => {
+    try {
+      const res = await fetch("/api/menu/ingredients");
+      const json = await res.json();
+      if (json.success) setIngredientsList(json.data.map((i) => i.name));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  useEffect(() => {
+    if (id) {
+      fetchProduct();
+      fetchTaxes();
+      fetchServiceTax();
+      fetchSizes();
+      fetchAddons();
+      fetchIngredients();
+    }
+  }, [id]);
+
+  const handleAddSizeSubmit = async (e) => {
+    e.preventDefault();
+    if (!newSizeName.trim()) {
+      toast.error("Please enter a size name.");
+      return;
+    }
+
+    try {
+      const res = await fetch("/api/menu/sizes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: newSizeName.trim() })
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast.success("Size option created!");
+        setNewSizeName("");
+        setIsSizeModalOpen(false);
+        fetchSizes();
+      } else {
+        toast.error(json.message);
+      }
+    } catch (e) {
+      toast.error("Failed to create size");
+    }
+  };
+
+  const handleAddAddonSubmit = async (e) => {
+    e.preventDefault();
+    if (!newAddonName.trim()) {
+      toast.error("Please enter a valid name.");
+      return;
+    }
+
+    try {
+      const res = await fetch("/api/menu/addons", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: newAddonName.trim() })
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast.success("Addon configured!");
+        setNewAddonName("");
+        setIsAddonModalOpen(false);
+        fetchAddons();
+      } else {
+        toast.error(json.message);
+      }
+    } catch (e) {
+      toast.error("Failed to create addon");
+    }
+  };
+
+  const handleAddIngredientSubmit = async (e) => {
+    e.preventDefault();
+    if (!newIngredientName.trim()) {
+      toast.error("Please enter an ingredient name.");
+      return;
+    }
+
+    try {
+      const res = await fetch("/api/menu/ingredients", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: newIngredientName.trim() }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast.success("Ingredient created!");
+        setNewIngredientName("");
+        setIsIngredientModalOpen(false);
+        fetchIngredients();
+      } else {
+        toast.error(json.message);
+      }
+    } catch (e) {
+      toast.error("Failed to create ingredient");
+    }
+  };
+
+  const addIngredientToVariant = (index, name) => {
+    const trimmed = String(name || "").trim();
+    if (!trimmed) return;
+    const newVariants = [...variants];
+    const current = Array.isArray(newVariants[index].ingredients)
+      ? newVariants[index].ingredients
+      : [];
+    if (current.some((i) => i.toLowerCase() === trimmed.toLowerCase())) return;
+    newVariants[index] = { ...newVariants[index], ingredients: [...current, trimmed] };
+    setVariants(newVariants);
+  };
+
+  const removeIngredientFromVariant = (index, name) => {
+    const newVariants = [...variants];
+    const current = Array.isArray(newVariants[index].ingredients)
+      ? newVariants[index].ingredients
+      : [];
+    newVariants[index] = {
+      ...newVariants[index],
+      ingredients: current.filter((i) => i !== name),
+    };
+    setVariants(newVariants);
+  };
+
+  const addIngredientToAddon = (index, name) => {
+    const trimmed = String(name || "").trim();
+    if (!trimmed) return;
+    const newAddons = [...addons];
+    const current = Array.isArray(newAddons[index].ingredients)
+      ? newAddons[index].ingredients
+      : [];
+    if (current.some((i) => i.toLowerCase() === trimmed.toLowerCase())) return;
+    newAddons[index] = { ...newAddons[index], ingredients: [...current, trimmed] };
+    setAddons(newAddons);
+  };
+
+  const removeIngredientFromAddon = (index, name) => {
+    const newAddons = [...addons];
+    const current = Array.isArray(newAddons[index].ingredients)
+      ? newAddons[index].ingredients
+      : [];
+    newAddons[index] = {
+      ...newAddons[index],
+      ingredients: current.filter((i) => i !== name),
+    };
+    setAddons(newAddons);
+  };
+
+
+
+  const handleToggleVariantStatus = (index) => {
+    const newVariants = [...variants];
+    newVariants[index].status = !newVariants[index].status;
+    setVariants(newVariants);
+  };
+
+  const handleDeleteVariant = (index) => {
+    const newVariants = [...variants];
+    newVariants.splice(index, 1);
+    setVariants(newVariants);
+  };
+
+  const handleToggleAddonStatus = (index) => {
+    const newAddons = [...addons];
+    newAddons[index].status = !newAddons[index].status;
+    setAddons(newAddons);
+  };
+
+  const handleDeleteAddon = (index) => {
+    if (addons[index]?.fromCategory) {
+      toast.error("This addon comes from the category and cannot be removed here.");
+      return;
+    }
+    const newAddons = [...addons];
+    newAddons.splice(index, 1);
+    setAddons(newAddons);
+  };
+
+  const handleSaveConfiguration = async () => {
+    if (!productType || !["KITCHEN", "BAR"].includes(productType)) {
+      toast.error("Product type is required. Select Kitchen Item or Bar / Counter.");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/menu/products/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          description,
+          productType,
+          taxValue: parseFloat(taxValue) || 0,
+          taxes: availableTaxes.map(t => t._id),
+          variants: variants.filter(v => v.size).map(v => ({
+            ...v,
+            price: parseFloat(v.price) || 0,
+            ingredients: Array.isArray(v.ingredients) ? v.ingredients : [],
+            choiceOptions: serializeAddonChoiceOptions(v.choiceOptions),
+          })),
+          addons: addons.filter(a => a.name).map(a => ({
+            ...a,
+            price: parseFloat(a.price) || 0,
+            ingredients: Array.isArray(a.ingredients) ? a.ingredients : [],
+            choiceOptions: serializeAddonChoiceOptions(a.choiceOptions),
+          })),
+          preparationStyles: preparationStyles.filter(s => s.trim() !== ""),
+          customData: customData
+            .map((group) => ({
+              name: (group.name || "").trim(),
+              subChoices: (group.subChoices || [])
+                .map((value) => String(value || "").trim())
+                .filter(Boolean),
+            }))
+            .filter((group) => group.name && group.subChoices.length > 0),
+          choiceOptions: choiceOptions
+            .map((group) => ({
+              name: (group.name || "").trim(),
+              subChoices: (group.subChoices || []).map((value) => value.trim()).filter(Boolean),
+            }))
+            .filter((group) => group.name && group.subChoices.length > 0),
+          image: product?.image,
+          salesImage: product?.salesImage,
+        })
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast.success("Product configuration saved successfully!");
+        router.push("/admin/menu/products");
+      } else {
+        toast.error(json.message);
+      }
+    } catch (e) {
+      toast.error("Failed to save configuration");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleImageUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      return toast.error("Please select an image file.");
+    }
+
+    // Quick size check (e.g., max 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      return toast.error("Image size must be less than 5MB.");
+    }
+
+    setUploadingImage(true);
+    const formDataUpload = new FormData();
+    formDataUpload.append("file", file);
+
+    const existingKey = product?.image?.key;
+    if (existingKey) {
+      try { await fetch(`/api/cloudinary?key=${existingKey}`, { method: 'DELETE' }); } catch (e) { }
+    }
+
+    try {
+      const res = await fetch("/api/cloudinary", {
+        method: "POST",
+        body: formDataUpload,
+      });
+      const data = await res.json();
+      if (res.ok && data.url) {
+        toast.success("Online image uploaded!");
+        setProduct((prev) => ({ ...prev, image: { url: data.url, key: data.key || "" } }));
+      } else {
+        toast.error("Cloudinary upload failed: " + (data.error || "Unknown error"));
+      }
+    } catch (error) {
+      toast.error("Cloudinary upload error: " + error.message);
+    } finally {
+      setUploadingImage(false);
+      // Reset input value so same file can be selected again if needed
+      e.target.value = "";
+    }
+  };
+
+  const handleSalesImageUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      return toast.error("Please select an image file.");
+    }
+
+    if (file.size > 5 * 1024 * 1024) {
+      return toast.error("Image size must be less than 5MB.");
+    }
+
+    setUploadingSalesImage(true);
+    const formDataUpload = new FormData();
+    formDataUpload.append("file", file);
+
+    const existingKey = product?.salesImage?.key;
+    if (existingKey) {
+      try { await fetch(`/api/cloudinary?key=${existingKey}`, { method: "DELETE" }); } catch (err) { /* ignore */ }
+    }
+
+    try {
+      const res = await fetch("/api/cloudinary", {
+        method: "POST",
+        body: formDataUpload,
+      });
+      const data = await res.json();
+      if (res.ok && data.url) {
+        toast.success("Sales POS image uploaded!");
+        setProduct((prev) => ({
+          ...prev,
+          salesImage: { url: data.url, key: data.key || "" },
+        }));
+      } else {
+        toast.error("Cloudinary upload failed: " + (data.error || "Unknown error"));
+      }
+    } catch (error) {
+      toast.error("Cloudinary upload error: " + error.message);
+    } finally {
+      setUploadingSalesImage(false);
+      e.target.value = "";
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex flex-col h-screen overflow-hidden" style={{ backgroundColor: PALETTE.canvas }}>
+        <div className="flex-1 flex items-center justify-center">
+          <Loader2 className="w-8 h-8 animate-spin text-zinc-400" />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col overflow-hidden" style={{ backgroundColor: PALETTE.canvas, color: PALETTE.ink }}>
+      <div className="flex-1 flex overflow-hidden">
+        <main className="flex-1 overflow-y-auto p-8">
+          <div className="max-w-300 mx-auto space-y-8">
+            {/* Top Header & Back Button */}
+            <div className="flex flex-col sm:flex-row justify-between sm:items-end gap-4 border-b border-zinc-200 pb-5">
+              <div>
+                <h1 className="text-[32px] font-bold leading-tight" style={{ color: PALETTE.ink }}>
+                  Product Configuration
+                </h1>
+                <p className="text-[15px] mt-1" style={{ color: PALETTE.inkMuted }}>
+                  Configure pricing, available sizes, addons, and tax overrides.
+                </p>
+              </div>
+              <Button variant="outline" asChild className="h-10 px-4 font-semibold text-[15px] gap-2 hover:bg-zinc-50 border-zinc-200 text-zinc-700">
+                <Link href="/admin/menu/products">
+                  <ArrowLeft className="w-5 h-5" />
+                  Back To Products
+                </Link>
+              </Button>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+              {/* Left Column (Main Form Fields) */}
+              <div className="lg:col-span-8 space-y-6">
+
+                {/* Basic Info Card */}
+                <Card className="shadow-sm border-zinc-200 bg-white overflow-hidden">
+                  <CardHeader className="bg-zinc-50/50 border-b border-zinc-100 pb-4">
+                    <CardTitle className="text-[18px] font-bold text-zinc-900">Basic Information</CardTitle>
+                    <CardDescription className="text-[14px]">Update the description for {product?.name}.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="p-6 space-y-5">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                      <div className="md:col-span-4 space-y-2">
+                        <label className="text-[14px] font-semibold text-zinc-900">
+                          Product Name (Read-Only)
+                        </label>
+                        <Input
+                          disabled
+                          className="h-11 text-[16px] bg-zinc-50 cursor-not-allowed"
+                          value={product?.name || ""}
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[14px] font-semibold text-zinc-900">
+                        Product Type <span className="text-red-500">*</span>
+                      </label>
+                      <Select value={productType || undefined} onValueChange={setProductType}>
+                        <SelectTrigger className="h-11 text-[16px] bg-white w-full">
+                          <SelectValue placeholder="Select product type" />
+                        </SelectTrigger>
+                        <SelectContent className="bg-white">
+                          <SelectItem value="KITCHEN">For Kitchen Item</SelectItem>
+                          <SelectItem value="BAR">Bar / Counter</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <p className="text-[12px] text-zinc-500">
+                        Controls whether this item routes to the kitchen KOT or bar/counter ticket.
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[14px] font-semibold text-zinc-900">
+                        Product Description
+                      </label>
+                      <textarea
+                        rows={4}
+                        placeholder="Describe the product..."
+                        value={description}
+                        onChange={(e) => setDescription(e.target.value)}
+                        className="w-full h-auto bg-white border border-zinc-200 rounded-md p-3 text-[16px] focus:outline-none focus:ring-2 focus:ring-[#F97316] focus:border-transparent transition-shadow"
+                      />
+                    </div>
+                    
+                    <div className="space-y-3 pt-2">
+                      <label className="text-[14px] font-semibold text-zinc-900">
+                        Style of Preparation
+                      </label>
+                      {preparationStyles.map((style, index) => (
+                        <div key={index} className="flex items-center gap-3">
+                          <Input
+                            placeholder="preparing of dish using differnt styles , etc"
+                            value={style}
+                            onChange={(e) => {
+                              const newStyles = [...preparationStyles];
+                              newStyles[index] = e.target.value;
+                              setPreparationStyles(newStyles);
+                            }}
+                            className="flex-1 h-11 bg-white border-zinc-200"
+                          />
+                          {index === preparationStyles.length - 1 ? (
+                            <Button 
+                              type="button" 
+                              variant="outline" 
+                              size="icon" 
+                              onClick={() => setPreparationStyles([...preparationStyles, ""])}
+                              className="h-11 w-11 shrink-0"
+                            >
+                              <Plus className="h-4 w-4" />
+                            </Button>
+                          ) : (
+                            <Button 
+                              type="button" 
+                              variant="outline" 
+                              size="icon" 
+                              onClick={() => {
+                                const newStyles = [...preparationStyles];
+                                newStyles.splice(index, 1);
+                                setPreparationStyles(newStyles);
+                              }}
+                              className="h-11 w-11 shrink-0 text-red-500 hover:text-red-600 hover:bg-red-50 border-zinc-200"
+                            >
+                              <Trash className="h-4 w-4" />
+                            </Button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="shadow-sm border-zinc-200 bg-white overflow-hidden">
+                  <CardHeader className="bg-zinc-50/50 border-b border-zinc-100 pb-4">
+                    <CardTitle className="text-[18px] font-bold text-zinc-900">Custom Data</CardTitle>
+                    <CardDescription className="text-[14px]">
+                      Add a named group and its option names. Customers pick one option (radio).
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="p-6 space-y-6">
+                    {customData.length === 0 && (
+                      <p className="text-[13px] text-zinc-500">
+                        No custom data groups. Add one for name → options (single select).
+                      </p>
+                    )}
+                    {customData.map((group, groupIndex) => (
+                      <div
+                        key={`custom-data-group-${groupIndex}`}
+                        className="space-y-4 border border-zinc-200 rounded-xl p-4 bg-white"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <label className="text-[14px] font-semibold text-zinc-900">
+                            Custom Data
+                          </label>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => {
+                              setCustomData(
+                                customData.filter((_, i) => i !== groupIndex),
+                              );
+                            }}
+                            className="h-9 px-3 shrink-0 text-red-500 hover:text-red-700 hover:bg-red-50"
+                            aria-label="Delete custom data group"
+                          >
+                            <Trash2 className="w-4 h-4 mr-1.5" />
+                            Delete
+                          </Button>
+                        </div>
+                        <Input
+                          type="text"
+                          placeholder="Enter Your Custom Data Name"
+                          value={group.name}
+                          onChange={(e) => {
+                            const next = [...customData];
+                            next[groupIndex] = { ...next[groupIndex], name: e.target.value };
+                            setCustomData(next);
+                          }}
+                          className="h-11 text-[15px] bg-white rounded-full px-5"
+                        />
+                        <div className="space-y-3">
+                          <label className="text-[14px] font-semibold text-zinc-900">
+                            Options
+                          </label>
+                          <div className="grid grid-cols-2 gap-3">
+                            {(group.subChoices || []).map((option, optionIndex) => (
+                              <div
+                                key={`custom-option-${groupIndex}-${optionIndex}`}
+                                className="flex items-center gap-1.5"
+                              >
+                                <Input
+                                  type="text"
+                                  placeholder="Option name"
+                                  value={option}
+                                  onChange={(e) => {
+                                    const next = [...customData];
+                                    const subChoices = [...next[groupIndex].subChoices];
+                                    subChoices[optionIndex] = e.target.value;
+                                    next[groupIndex] = { ...next[groupIndex], subChoices };
+                                    setCustomData(next);
+                                  }}
+                                  className="h-10 text-[14px] bg-white rounded-full px-4"
+                                />
+                                {(group.subChoices || []).length > 1 && (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    onClick={() => {
+                                      const next = [...customData];
+                                      const subChoices = [...next[groupIndex].subChoices];
+                                      subChoices.splice(optionIndex, 1);
+                                      next[groupIndex] = { ...next[groupIndex], subChoices };
+                                      setCustomData(next);
+                                    }}
+                                    className="h-10 w-10 p-0 shrink-0 text-red-500 hover:text-red-700 hover:bg-red-50"
+                                    aria-label="Delete option"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </Button>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                          <div className="flex items-center justify-end gap-3 pt-1">
+                            <span className="text-[13px] font-medium text-zinc-600">
+                              Need more option
+                            </span>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              onClick={() => {
+                                const next = [...customData];
+                                next[groupIndex] = {
+                                  ...next[groupIndex],
+                                  subChoices: [
+                                    ...(next[groupIndex].subChoices || []),
+                                    "",
+                                  ],
+                                };
+                                setCustomData(next);
+                              }}
+                              className="h-10 w-10 p-0 shrink-0 text-zinc-700"
+                            >
+                              <Plus className="w-5 h-5" />
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                    <div className="flex justify-end">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() =>
+                          setCustomData([
+                            ...customData,
+                            {
+                              name: "",
+                              subChoices: ["", ""],
+                            },
+                          ])
+                        }
+                        className="h-9 px-4 font-semibold text-zinc-700"
+                      >
+                        <Plus className="w-4 h-4 mr-2" /> Add Custom Data
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="shadow-sm border-zinc-200 bg-white overflow-hidden">
+                  <CardHeader className="bg-zinc-50/50 border-b border-zinc-100 pb-4">
+                    <CardTitle className="text-[18px] font-bold text-zinc-900">Choice Option</CardTitle>
+                    <CardDescription className="text-[14px]">
+                      Add named choice groups and their selectable sub-choices.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="p-6 space-y-6">
+                    {choiceOptions.length === 0 && (
+                      <p className="text-[13px] text-zinc-500">
+                        No choice groups. Add one if this product needs extra selectable options.
+                      </p>
+                    )}
+                    {choiceOptions.map((group, groupIndex) => (
+                      <div
+                        key={`choice-group-${groupIndex}`}
+                        className="space-y-4 border border-zinc-200 rounded-xl p-4 bg-white"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <label className="text-[14px] font-semibold text-zinc-900">
+                            Choice Option
+                          </label>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => {
+                              setChoiceOptions(
+                                choiceOptions.filter((_, i) => i !== groupIndex),
+                              );
+                            }}
+                            className="h-9 px-3 shrink-0 text-red-500 hover:text-red-700 hover:bg-red-50"
+                            aria-label="Delete choice option"
+                          >
+                            <Trash2 className="w-4 h-4 mr-1.5" />
+                            Delete
+                          </Button>
+                        </div>
+                        <Input
+                          type="text"
+                          placeholder="Example: Topping Options Name Title"
+                          value={group.name}
+                          onChange={(e) => {
+                            const next = [...choiceOptions];
+                            next[groupIndex] = { ...next[groupIndex], name: e.target.value };
+                            setChoiceOptions(next);
+                          }}
+                          className="h-11 text-[15px] bg-white rounded-full px-5"
+                        />
+                        <div className="space-y-3">
+                          <label className="text-[14px] font-semibold text-zinc-900">
+                            Add Option :
+                          </label>
+                          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                            {group.subChoices.map((option, optionIndex) => (
+                              <div
+                                key={`choice-${groupIndex}-${optionIndex}`}
+                                className="flex items-center gap-1.5"
+                              >
+                                <Input
+                                  type="text"
+                                  placeholder="Type Choice"
+                                  value={option}
+                                  onChange={(e) => {
+                                    const next = [...choiceOptions];
+                                    const subChoices = [...next[groupIndex].subChoices];
+                                    subChoices[optionIndex] = e.target.value;
+                                    next[groupIndex] = { ...next[groupIndex], subChoices };
+                                    setChoiceOptions(next);
+                                  }}
+                                  className="h-10 text-[14px] bg-white rounded-full px-4"
+                                />
+                                {group.subChoices.length > 1 && (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    onClick={() => {
+                                      const next = [...choiceOptions];
+                                      const subChoices = [...next[groupIndex].subChoices];
+                                      subChoices.splice(optionIndex, 1);
+                                      next[groupIndex] = { ...next[groupIndex], subChoices };
+                                      setChoiceOptions(next);
+                                    }}
+                                    className="h-10 w-10 p-0 shrink-0 text-red-500 hover:text-red-700 hover:bg-red-50"
+                                    aria-label="Delete sub choice"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </Button>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                          <div className="flex items-center justify-end gap-3 pt-1">
+                            <span className="text-[13px] font-medium text-zinc-600">
+                              Need More Choice Option
+                            </span>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              onClick={() => {
+                                const next = [...choiceOptions];
+                                next[groupIndex] = {
+                                  ...next[groupIndex],
+                                  subChoices: [...next[groupIndex].subChoices, ""],
+                                };
+                                setChoiceOptions(next);
+                              }}
+                              className="h-10 w-10 p-0 shrink-0 text-zinc-700"
+                            >
+                              <Plus className="w-5 h-5" />
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                    <div className="flex justify-end">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() =>
+                          setChoiceOptions([
+                            ...choiceOptions,
+                            { name: "", subChoices: ["", "", "", ""] },
+                          ])
+                        }
+                        className="h-9 px-4 font-semibold text-zinc-700"
+                      >
+                        <Plus className="w-4 h-4 mr-2" /> Add Choice Option
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Pricing, Size, Addons Card */}
+                <Card className="shadow-sm border-zinc-200 bg-white overflow-hidden">
+                  <CardHeader className="bg-zinc-50/50 border-b border-zinc-100 pb-4">
+                    <CardTitle className="text-[18px] font-bold text-zinc-900">Pricing & Sizes</CardTitle>
+                    <CardDescription className="text-[14px]">Configure pricing variations and link available addons.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="p-6 space-y-6">
+                    <div className="space-y-4">
+                      {variants.map((variant, index) => (
+                        <div key={index} className="border border-zinc-100 p-4 rounded-md bg-zinc-50/50 space-y-4">
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
+                          <div className="space-y-2">
+                            <label className="text-[14px] font-semibold text-zinc-900">
+                              Price Amount ($) <span className="text-red-500">*</span>
+                            </label>
+                            <Input
+                              type="number"
+                              step="0.01"
+                              placeholder="0.00"
+                              value={variant.price || ""}
+                              onChange={(e) => {
+                                const newVariants = [...variants];
+                                newVariants[index].price = e.target.value;
+                                setVariants(newVariants);
+                              }}
+                              className="h-11 text-[16px] bg-white font-medium"
+                            />
+                          </div>
+
+                          <div className="space-y-2">
+                            <label className="text-[14px] font-semibold text-zinc-900">
+                              Size Option
+                            </label>
+                            <div className="flex gap-2">
+                              <Select
+                                value={variant.size || ""}
+                                onValueChange={(val) => {
+                                  const newVariants = [...variants];
+                                  newVariants[index].size = val;
+                                  setVariants(newVariants);
+                                }}
+                              >
+                                <SelectTrigger className="h-11 text-[16px] bg-white flex-1">
+                                  <SelectValue placeholder="Select Size" />
+                                </SelectTrigger>
+                                <SelectContent className="bg-white max-h-60 overflow-y-auto">
+                                  {sizesList.map((sz, idx) => (
+                                    <SelectItem key={idx} value={sz}>{sz}</SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              <Button
+                                type="button"
+                                onClick={() => setIsSizeModalOpen(true)}
+                                variant="outline"
+                                className="h-11 w-11 p-0 shrink-0 text-zinc-600 hover:text-zinc-900 border-zinc-200"
+                              >
+                                <Plus className="h-5 w-5" />
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                onClick={() => handleDeleteVariant(index)}
+                                className="h-11 w-11 p-0 shrink-0 text-red-500 hover:text-red-700 border-red-200 hover:bg-red-50"
+                              >
+                                <Trash2 className="h-5 w-5" />
+                              </Button>
+                            </div>
+                          </div>
+                          </div>
+
+                          <div className="space-y-2">
+                            <label className="text-[14px] font-semibold text-zinc-900">
+                              Ingredients
+                            </label>
+                            <div className="flex gap-2">
+                              <Select
+                                key={`variant-ing-${index}-${(variant.ingredients || []).length}`}
+                                onValueChange={(val) => addIngredientToVariant(index, val)}
+                              >
+                                <SelectTrigger className="h-11 text-[16px] bg-white flex-1">
+                                  <SelectValue placeholder="Select ingredient" />
+                                </SelectTrigger>
+                                <SelectContent className="bg-white max-h-60 overflow-y-auto">
+                                  {ingredientsList.map((ing, idx) => (
+                                    <SelectItem key={idx} value={ing}>{ing}</SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              <Button
+                                type="button"
+                                onClick={() => setIsIngredientModalOpen(true)}
+                                variant="outline"
+                                className="h-11 w-11 p-0 shrink-0 text-zinc-600 hover:text-zinc-900 border-zinc-200"
+                              >
+                                <Plus className="h-5 w-5" />
+                              </Button>
+                            </div>
+                            {(variant.ingredients || []).length > 0 && (
+                              <div className="flex flex-wrap gap-2 pt-1">
+                                {(variant.ingredients || []).map((ing) => (
+                                  <Badge
+                                    key={ing}
+                                    className="bg-orange-50 text-orange-800 border border-orange-200 hover:bg-orange-50 pl-2.5 pr-1 py-1 gap-1 font-medium"
+                                  >
+                                    {ing}
+                                    <button
+                                      type="button"
+                                      onClick={() => removeIngredientFromVariant(index, ing)}
+                                      className="ml-0.5 rounded-full p-0.5 hover:bg-orange-100"
+                                      aria-label={`Remove ${ing}`}
+                                    >
+                                      <X className="h-3 w-3" />
+                                    </button>
+                                  </Badge>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          <AddonChoiceOptionsEditor
+                            choiceOptions={variant.choiceOptions || []}
+                            onChange={(choiceOptions) => {
+                              const newVariants = [...variants];
+                              newVariants[index] = { ...newVariants[index], choiceOptions };
+                              setVariants(newVariants);
+                            }}
+                          />
+                        </div>
+                      ))}
+                      <div className="mt-4 flex justify-end">
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          className="h-9"
+                          onClick={() => setVariants([...variants, { price: "", size: sizesList[0] || "Regular", status: true, ingredients: [], choiceOptions: [] }])}
+                        >
+                          Add More Variants
+                        </Button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2 pt-6 border-t border-zinc-100">
+                      <div className="space-y-4 pt-6 border-t border-zinc-100">
+                        <label className="text-[16px] underline font-semibold text-zinc-900 block">
+                          Link Addons
+                        </label>
+                        {addons.map((addon, index) => (
+                          <div key={index} className="border border-zinc-100 p-4 rounded-md bg-zinc-50/50 space-y-4">
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
+                            <div className="space-y-2">
+                              <label className="text-[13px] font-semibold text-zinc-900 flex items-center gap-2">
+                                Price Amount ($)
+                                {addon.fromCategory && (
+                                  <Badge className="bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-50 text-[10px] uppercase tracking-wide">
+                                    Category
+                                  </Badge>
+                                )}
+                              </label>
+                              <Input
+                                type="number"
+                                step="0.01"
+                                placeholder="0.00"
+                                value={addon.price || ""}
+                                onChange={(e) => {
+                                  const newAddons = [...addons];
+                                  newAddons[index].price = e.target.value;
+                                  setAddons(newAddons);
+                                }}
+                                className="h-11 text-[16px] bg-white"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <label className="text-[13px] font-semibold text-zinc-900">Addon Selection</label>
+                              <div className="flex gap-2">
+                                <Select
+                                  value={addon.name || ""}
+                                  onValueChange={(val) => {
+                                    const newAddons = [...addons];
+                                    newAddons[index].name = val;
+                                    setAddons(newAddons);
+                                  }}
+                                  disabled={addon.fromCategory}
+                                >
+                                  <SelectTrigger className="h-11 text-[16px] bg-white flex-1">
+                                    <SelectValue placeholder="Select Addon" />
+                                  </SelectTrigger>
+                                  <SelectContent className="bg-white max-h-60 overflow-y-auto">
+                                    {addonsList.map((ad, idx) => (
+                                      <SelectItem key={idx} value={ad}>{ad}</SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                                <Button
+                                  type="button"
+                                  onClick={() => setIsAddonModalOpen(true)}
+                                  variant="outline"
+                                  className="h-11 w-11 p-0 shrink-0 text-zinc-600 hover:text-zinc-900 border-zinc-200"
+                                >
+                                  <Plus className="h-5 w-5" />
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  onClick={() => handleDeleteAddon(index)}
+                                  disabled={addon.fromCategory}
+                                  className="h-11 w-11 p-0 shrink-0 text-red-500 hover:text-red-700 border-red-200 hover:bg-red-50 disabled:opacity-40"
+                                >
+                                  <Trash2 className="h-5 w-5" />
+                                </Button>
+                              </div>
+                            </div>
+                            </div>
+                            <AddonChoiceOptionsEditor
+                              choiceOptions={addon.choiceOptions || []}
+                              onChange={(choiceOptions) => {
+                                const newAddons = [...addons];
+                                newAddons[index] = { ...newAddons[index], choiceOptions };
+                                setAddons(newAddons);
+                              }}
+                            />
+                          </div>
+                        ))}
+                        <div className="flex justify-end mt-2">
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            className="h-9"
+                            onClick={() => setAddons([...addons, { name: addonsList[0] || "", price: "", size: "Regular", status: true, ingredients: [], choiceOptions: normalizeAddonChoiceOptionsForForm([]) }])}
+                          >
+                            Add More Addons
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+
+              {/* Right Column (Sidebar Settings) */}
+              <div className="lg:col-span-4 space-y-6">
+                <Card className="shadow-sm border-zinc-200 bg-white overflow-hidden">
+                  <CardHeader className="bg-zinc-50/50 border-b border-zinc-100 pb-4">
+                    <CardTitle className="text-[18px] font-bold text-zinc-900">Tax & Media</CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-6 space-y-6">
+                    <div className="space-y-3">
+                      <label className="text-[14px] font-semibold text-zinc-900">
+                        Applicable Taxes / Fees
+                      </label>
+                      {availableTaxes.length > 0 ? (
+                        <div className="space-y-4">
+                          <div className="p-3 bg-orange-50 border border-orange-100 rounded-md">
+                            <p className="text-[13px] text-orange-800 font-medium">
+                              {availableTaxes.length} active tax{availableTaxes.length !== 1 ? 'es' : ''} will be automatically applied to this product.
+                            </p>
+                          </div>
+                          <div className="grid grid-cols-1 gap-2">
+                            {availableTaxes.map((tax) => (
+                              <div
+                                key={tax._id}
+                                className="flex items-center justify-between p-3 rounded-md border border-zinc-200 bg-zinc-50"
+                              >
+                                <span className="text-[14px] font-medium text-zinc-900">{tax.name}</span>
+                                <span className="text-[13px] font-bold text-zinc-600">
+                                  {tax.type === "percent" || tax.type === "Percent" ? `${tax.value}%` : `$${tax.value.toFixed(2)}`}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="p-4 rounded-md border border-zinc-200 bg-zinc-50 text-center">
+                          <p className="text-[13px] text-zinc-500">No taxes configured.</p>
+                          <Link href="/admin/tax/details" className="text-[13px] text-blue-600 font-medium hover:underline mt-1 block">
+                            Configure Taxes
+                          </Link>
+                        </div>
+                      )}
+                    </div>
+
+                    {serviceTax && (
+                      <div className="space-y-3">
+                        <label className="text-[14px] font-semibold text-zinc-900">
+                          Server Charge
+                        </label>
+                        <div className="flex items-center justify-between p-3 rounded-md border border-zinc-200 bg-zinc-50">
+                          <span className="text-[14px] font-medium text-zinc-900">
+                            {serviceTax.name || "Server Charge"}
+                          </span>
+                          <span className="text-[13px] font-bold text-zinc-600">
+                            {serviceTax.type === "Percent" ||
+                            serviceTax.type === "percent"
+                              ? `${Number(serviceTax.value)}%`
+                              : `$${Number(serviceTax.value).toFixed(2)}`}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="space-y-2">
+                      <label className="text-[14px] font-semibold text-zinc-900">
+                        Online menu image
+                      </label>
+                      <p className="text-[12px] text-zinc-500">
+                        Used on the public / online menu only.
+                      </p>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        id="product-image-upload"
+                        className="hidden"
+                        onChange={handleImageUpload}
+                        disabled={uploadingImage}
+                      />
+                      <label
+                        htmlFor="product-image-upload"
+                        className={`w-full flex flex-col items-center justify-center gap-2 border-2 border-dashed border-zinc-300 rounded-lg h-32 hover:border-[#F97316] hover:bg-orange-50/50 transition-colors cursor-pointer group ${uploadingImage ? 'opacity-50 pointer-events-none' : ''}`}
+                      >
+                        {uploadingImage ? (
+                          <Loader2 className="h-6 w-6 animate-spin text-zinc-400" />
+                        ) : product?.image?.url ? (
+                          <div className="relative w-full h-full p-1 rounded-md overflow-hidden">
+                            <Image
+                              width={100}
+                              height={150}
+                              src={product.image.url} alt="Online product" className="w-full h-full object-contain rounded-md" />
+                            <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity rounded-md">
+                              <span className="text-white text-xs font-semibold">Change Image</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="h-10 w-10 rounded-full bg-zinc-100 group-hover:bg-orange-100 flex items-center justify-center transition-colors">
+                              <ImageIcon className="h-5 w-5 text-zinc-500 group-hover:text-[#F97316]" />
+                            </div>
+                            <span className="text-[13px] font-medium text-zinc-600 group-hover:text-zinc-900">Click to upload online image</span>
+                          </>
+                        )}
+                      </label>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-[14px] font-semibold text-zinc-900">
+                        Sales POS image
+                      </label>
+                      <p className="text-[12px] text-zinc-500">
+                        Shown only on Sales create-order tiles and list cards.
+                      </p>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        id="product-sales-image-upload"
+                        className="hidden"
+                        onChange={handleSalesImageUpload}
+                        disabled={uploadingSalesImage}
+                      />
+                      <label
+                        htmlFor="product-sales-image-upload"
+                        className={`w-full flex flex-col items-center justify-center gap-2 border-2 border-dashed border-zinc-300 rounded-lg h-32 hover:border-[#F97316] hover:bg-orange-50/50 transition-colors cursor-pointer group ${uploadingSalesImage ? "opacity-50 pointer-events-none" : ""}`}
+                      >
+                        {uploadingSalesImage ? (
+                          <Loader2 className="h-6 w-6 animate-spin text-zinc-400" />
+                        ) : product?.salesImage?.url ? (
+                          <div className="relative w-full h-full p-1 rounded-md overflow-hidden">
+                            <Image
+                              width={100}
+                              height={150}
+                              src={product.salesImage.url}
+                              alt="Sales POS product"
+                              className="w-full h-full object-contain rounded-md"
+                            />
+                            <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity rounded-md">
+                              <span className="text-white text-xs font-semibold">Change Image</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="h-10 w-10 rounded-full bg-zinc-100 group-hover:bg-orange-100 flex items-center justify-center transition-colors">
+                              <ImageIcon className="h-5 w-5 text-zinc-500 group-hover:text-[#F97316]" />
+                            </div>
+                            <span className="text-[13px] font-medium text-zinc-600 group-hover:text-zinc-900">
+                              Click to upload sales image
+                            </span>
+                          </>
+                        )}
+                      </label>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Button
+                  onClick={handleSaveConfiguration}
+                  disabled={saving}
+                  className="w-full h-12 text-[15px] font-bold text-white transition-transform hover:scale-[1.02]"
+                  style={{ backgroundColor: PALETTE.accent }}
+                >
+                  {saving ? <Loader2 className="w-5 h-5 animate-spin" /> : "Save Configuration"}
+                </Button>
+              </div>
+            </div>
+
+            {/* Overview Tables Grid */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 pt-8">
+
+              {/* Table 1: Product Configs */}
+              <Card className="shadow-sm border-zinc-200 bg-white overflow-hidden">
+                <CardHeader className="px-6 py-5 border-b border-zinc-200">
+                  <CardTitle className="text-[16px] font-bold text-zinc-900">Active Configurations</CardTitle>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <Table>
+                    <TableHeader className="bg-zinc-50">
+                      <TableRow>
+                        <TableHead className="text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6 w-[40%]">Size</TableHead>
+                        <TableHead className="text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6 text-center">Price</TableHead>
+                        <TableHead className="text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6 text-center">Status</TableHead>
+                        <TableHead className="text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6 text-center">Actions</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {variants.length > 0 ? variants.map((det, index) => (
+                        <TableRow key={index} className="h-16 hover:bg-zinc-50 transition-colors">
+                          <TableCell className="px-6">
+                            <div className="flex flex-col">
+                              <span className="text-[15px] font-semibold text-zinc-900">{det.size}</span>
+                              {serializeAddonChoiceOptions(det.choiceOptions).length > 0 && (
+                                <span className="text-[11px] text-zinc-400 mt-1">
+                                  {serializeAddonChoiceOptions(det.choiceOptions).length} choice group(s)
+                                </span>
+                              )}
+                            </div>
+                          </TableCell>
+                          <TableCell className="px-6 text-center font-bold text-[15px] text-[#F97316]">
+                            ${Number(det.price || 0).toFixed(2)}
+                          </TableCell>
+                          <TableCell className="px-6 text-center">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleVariantStatus(index)}
+                              className="cursor-pointer transition-transform hover:scale-105"
+                            >
+                              {det.status ? (
+                                <Badge className="bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-none px-2.5 py-1 text-[13px] font-semibold">
+                                  Active
+                                </Badge>
+                              ) : (
+                                <Badge className="bg-zinc-100 text-zinc-600 hover:bg-zinc-200 border-none px-2.5 py-1 text-[13px] font-semibold">
+                                  Inactive
+                                </Badge>
+                              )}
+                            </button>
+                          </TableCell>
+                          <TableCell className="px-6 text-center">
+                            <Button variant="ghost" size="icon" className="h-8 w-8 text-red-500 hover:text-red-700 hover:bg-red-50" onClick={() => handleDeleteVariant(index)}>
+                              <Trash className="h-4 w-4" />
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      )) : (
+                        <TableRow>
+                          <TableCell colSpan={4} className="h-24 text-center text-zinc-500 text-[14px]">No configurations found.</TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </CardContent>
+              </Card>
+
+              {/* Table 2: Addons */}
+              <Card className="shadow-sm border-zinc-200 bg-white overflow-hidden">
+                <CardHeader className="px-4 py-5 border-b border-zinc-200">
+                  <CardTitle className="text-[16px] font-bold text-zinc-900">Active Addons</CardTitle>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <Table>
+                    <TableHeader className="bg-zinc-50">
+                      <TableRow>
+                        <TableHead className="text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6 w-[40%]">Addon / Size</TableHead>
+                        <TableHead className="text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6 text-center">Price</TableHead>
+                        <TableHead className="text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6 text-center">Status</TableHead>
+                        <TableHead className="text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6 text-center">Actions</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {addons.length > 0 ? addons.map((add, index) => (
+                        <TableRow key={index} className="h-16 hover:bg-zinc-50 transition-colors">
+                          <TableCell className="px-4">
+                            <div className="flex flex-col">
+                              <span className="text-[15px] font-semibold text-zinc-900 flex items-center gap-2">
+                                {add.name}
+                                {add.fromCategory && (
+                                  <Badge className="bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-50 text-[10px] uppercase tracking-wide">
+                                    Category
+                                  </Badge>
+                                )}
+                              </span>
+                              <span className="text-[13px] text-zinc-500 mt-0.5">{add.size}</span>
+                              {serializeAddonChoiceOptions(add.choiceOptions).length > 0 && (
+                                <span className="text-[11px] text-zinc-400 mt-1">
+                                  {serializeAddonChoiceOptions(add.choiceOptions).length} choice group(s)
+                                </span>
+                              )}
+                            </div>
+                          </TableCell>
+                          <TableCell className="px-6 text-center font-bold text-[15px] text-[#F97316]">
+                            ${Number(add.price || 0).toFixed(2)}
+                          </TableCell>
+                          <TableCell className="px-6 text-center">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleAddonStatus(index)}
+                              className="cursor-pointer transition-transform hover:scale-105"
+                            >
+                              {add.status ? (
+                                <Badge className="bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-none px-2.5 py-1 text-[13px] font-semibold">
+                                  Active
+                                </Badge>
+                              ) : (
+                                <Badge className="bg-zinc-100 text-zinc-600 hover:bg-zinc-200 border-none px-2.5 py-1 text-[13px] font-semibold">
+                                  Inactive
+                                </Badge>
+                              )}
+                            </button>
+                          </TableCell>
+                          <TableCell className="px-6 text-center">
+                            <Button variant="ghost" size="icon" className="h-8 w-8 text-red-500 hover:text-red-700 hover:bg-red-50 disabled:opacity-40" onClick={() => handleDeleteAddon(index)} disabled={add.fromCategory}>
+                              <Trash className="h-4 w-4" />
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      )) : (
+                        <TableRow>
+                          <TableCell colSpan={4} className="h-24 text-center text-zinc-500 text-[14px]">No addons found.</TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </CardContent>
+              </Card>
+            </div>
+
+            {/* 1. Create Size Modal */}
+            <Dialog open={isSizeModalOpen} onOpenChange={setIsSizeModalOpen}>
+              <DialogContent className="sm:max-w-106.25">
+                <form onSubmit={handleAddSizeSubmit}>
+                  <DialogHeader>
+                    <DialogTitle className="text-[22px] font-bold text-zinc-900">Create Size Option</DialogTitle>
+                    <DialogDescription className="text-[15px]">
+                      Add a new size that can be used for pricing variants.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="py-6">
+                    <div className="space-y-2">
+                      <label className="text-[14px] font-semibold text-zinc-900">
+                        Size Name <span className="text-red-500">*</span>
+                      </label>
+                      <Input
+                        autoFocus
+                        required
+                        placeholder="e.g. Large Patty, Family Size"
+                        className="h-11 text-[16px]"
+                        value={newSizeName}
+                        onChange={(e) => setNewSizeName(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                  <DialogFooter>
+                    <Button type="button" variant="outline" onClick={() => setIsSizeModalOpen(false)} className="h-11 px-6 font-semibold cursor-pointer">
+                      Cancel
+                    </Button>
+                    <Button type="submit" className="h-11 px-6 font-semibold cursor-pointer text-white" style={{ backgroundColor: PALETTE.accent }}>
+                      Save Size Option
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </DialogContent>
+            </Dialog>
+
+            {/* 2. Create Addons Modal */}
+            <Dialog open={isAddonModalOpen} onOpenChange={setIsAddonModalOpen}>
+              <DialogContent className="sm:max-w-106.25">
+                <form onSubmit={handleAddAddonSubmit}>
+                  <DialogHeader>
+                    <DialogTitle className="text-[22px] font-bold text-zinc-900">Create Addon</DialogTitle>
+                    <DialogDescription className="text-[15px]">
+                      Configure a new supplementary product addon.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="space-y-2">
+                    <label className="text-[14px] font-semibold text-zinc-900">
+                      Addon Name <span className="text-red-500">*</span>
+                    </label>
+                    <Input
+                      autoFocus
+                      required
+                      placeholder="e.g. Extra Bacon Strips"
+                      className="h-11 text-[16px]"
+                      value={newAddonName}
+                      onChange={(e) => setNewAddonName(e.target.value)}
+                    />
+                  </div>
+                  <DialogFooter className="pt-2">
+                    <Button type="button" variant="outline" onClick={() => setIsAddonModalOpen(false)} className="h-11 px-6 font-semibold cursor-pointer">
+                      Cancel
+                    </Button>
+                    <Button type="submit" className="h-11 px-6 font-semibold cursor-pointer text-white" style={{ backgroundColor: PALETTE.accent }}>
+                      Save Addon
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </DialogContent>
+            </Dialog>
+
+            {/* 3. Create Ingredient Modal */}
+            <Dialog open={isIngredientModalOpen} onOpenChange={setIsIngredientModalOpen}>
+              <DialogContent className="sm:max-w-106.25">
+                <form onSubmit={handleAddIngredientSubmit}>
+                  <DialogHeader>
+                    <DialogTitle className="text-[22px] font-bold text-zinc-900">Create Ingredient</DialogTitle>
+                    <DialogDescription className="text-[15px]">
+                      Add a new ingredient that can be linked to pricing variants and addons.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="py-6">
+                    <div className="space-y-2">
+                      <label className="text-[14px] font-semibold text-zinc-900">
+                        Ingredient Name <span className="text-red-500">*</span>
+                      </label>
+                      <Input
+                        autoFocus
+                        required
+                        placeholder="e.g. Lettuce, Cheddar Cheese"
+                        className="h-11 text-[16px]"
+                        value={newIngredientName}
+                        onChange={(e) => setNewIngredientName(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                  <DialogFooter>
+                    <Button type="button" variant="outline" onClick={() => setIsIngredientModalOpen(false)} className="h-11 px-6 font-semibold cursor-pointer">
+                      Cancel
+                    </Button>
+                    <Button type="submit" className="h-11 px-6 font-semibold cursor-pointer text-white" style={{ backgroundColor: PALETTE.accent }}>
+                      Save Ingredient
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </DialogContent>
+            </Dialog>
+          </div>
+        </main >
+      </div >
+    </div >
+  );
+}

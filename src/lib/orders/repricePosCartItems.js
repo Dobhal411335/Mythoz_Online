@@ -1,0 +1,496 @@
+import mongoose from "mongoose";
+import Product from "@/models/menu/Product";
+import Offer from "@/models/menu/Offer";
+import Tax from "@/models/tax/Tax";
+import ServiceTax from "@/models/tax/ServiceTax";
+import Coupon from "@/models/menu/Coupon";
+import {
+  STAFF_DISCOUNT_CODE,
+  calcStaffDiscountAmount,
+  normalizeStaffDiscountPercent,
+} from "@/lib/orders/staffDiscount";
+import { computeOrderServiceCharge } from "@/lib/orders/serviceCharge";
+import { filterOfferSelections } from "@/utils/offerDetails";
+import {
+  filterProductChoiceSelections,
+  filterCustomDataSelections,
+  normalizeChoiceOptions,
+  normalizeCustomExtras,
+  customExtrasUnitTotal,
+  validateAddonChoiceSelectionsAgainstLineQty,
+  resolveProductChoiceCatalog,
+} from "@/utils/productChoices";
+
+const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+function normalizeProductType(value) {
+  return String(value || "").toUpperCase() === "BAR" ? "BAR" : "KITCHEN";
+}
+
+function taxFromTaxData(taxData, unitPrice) {
+  if (!taxData) return 0;
+  const pct = Number(taxData.totalPercentage) || 0;
+  const fixed = Number(taxData.totalFixed) || 0;
+  return (unitPrice * pct) / 100 + fixed;
+}
+
+function taxFromTaxDocs(taxes, unitPrice) {
+  if (!Array.isArray(taxes) || taxes.length === 0) return 0;
+  let pct = 0;
+  let fixed = 0;
+  for (const t of taxes) {
+    if (!t || String(t.status || "").toLowerCase() === "inactive") continue;
+    const isPercent = String(t.type || "").toLowerCase().includes("percent");
+    if (isPercent) pct += Number(t.value) || 0;
+    else fixed += Number(t.value) || 0;
+  }
+  return (unitPrice * pct) / 100 + fixed;
+}
+
+function resolveVariantUnitPrice(product, sizes = []) {
+  const variants = Array.isArray(product.variants)
+    ? product.variants.filter((v) => v && v.status !== false)
+    : [];
+
+  const sizeNames = sizes.filter(
+    (s) => s && !/^standard$/i.test(s) && !/^extra$/i.test(s),
+  );
+
+  if (sizeNames.length > 0 && variants.length > 0) {
+    let sum = 0;
+    let matched = 0;
+    for (const size of sizeNames) {
+      const v = variants.find(
+        (x) => String(x.size).toLowerCase() === String(size).toLowerCase(),
+      );
+      if (v) {
+        sum += Number(v.price) || 0;
+        matched += 1;
+      }
+    }
+    if (matched > 0) return sum;
+  }
+
+  if (variants.length === 1) return Number(variants[0].price) || 0;
+  if (variants.length > 1) {
+    // No size selected: use cheapest active variant as base (POS usually picks size)
+    return Math.min(...variants.map((v) => Number(v.price) || 0));
+  }
+
+  // Legacy products may expose a virtual/plain price on lean docs
+  return Number(product.price) || 0;
+}
+
+function resolveAddonOnlyPrice(product, options = []) {
+  const addons = Array.isArray(product.addons)
+    ? product.addons.filter((a) => a && a.status !== false)
+    : [];
+  if (!addons.length) return 0;
+
+  let sum = 0;
+  let matched = 0;
+  for (const opt of options) {
+    const label = String(opt || "").trim();
+    if (!label || /^size:/i.test(label)) continue;
+    const addon = addons.find(
+      (a) =>
+        label === a.name ||
+        new RegExp(`^extra:\\s*${escapeRegExp(a.name)}$`, "i").test(label),
+    );
+    if (addon) {
+      sum += Number(addon.price) || 0;
+      matched += 1;
+    }
+  }
+  return matched > 0 ? sum : 0;
+}
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function addonExtra(product, options = []) {
+  // Addons attached to a main/variant line (not standalone Extra lines)
+  return resolveAddonOnlyPrice(product, options);
+}
+
+/**
+ * Recalculate POS cart lines from Product/Offer documents.
+ * Client qty/options/sizes are used; prices/taxes come from DB.
+ *
+ * Line types (matches Sales POS cart builders):
+ * - Offer: isOffer / Offers category → Offer.price
+ * - Extra: size === "Extra" → Product.addons price only
+ * - Variant/plain: Product.variants (+ optional addon options on same line)
+ *
+ * Product-level coupon discounts are intentionally NOT applied here — POS does
+ * not bake them into cart lines (order-level discountCode only).
+ */
+export async function repricePosCartItems({
+  restaurantId,
+  items,
+  discountCode = null,
+  staffDiscountPercent = null,
+  applyServiceCharge = false,
+}) {
+  if (!Array.isArray(items) || items.length === 0) {
+    const err = new Error("Cart cannot be empty");
+    err.status = 400;
+    throw err;
+  }
+
+  const productIds = [];
+  const offerIds = [];
+  for (const item of items) {
+    const id = item.id || item.menuItemId;
+    if (!id || !mongoose.Types.ObjectId.isValid(id)) continue;
+    const isOffer =
+      Boolean(item.isOffer) || /^offers?$/i.test(String(item.category || ""));
+    if (isOffer) offerIds.push(String(id));
+    else productIds.push(String(id));
+  }
+
+  const [products, offers, globalTaxes, serviceTax] = await Promise.all([
+    productIds.length
+      ? Product.find({
+          _id: { $in: productIds },
+          restaurant: restaurantId,
+          status: "Active",
+        })
+          .populate("taxes")
+          .lean()
+      : [],
+    offerIds.length
+      ? Offer.find({
+          _id: { $in: offerIds },
+          restaurant: restaurantId,
+          status: true,
+        }).lean()
+      : [],
+    Tax.find({ restaurant: restaurantId, status: "Active" }).lean(),
+    applyServiceCharge
+      ? ServiceTax.findOne({ restaurant: restaurantId, status: "Active" }).lean()
+      : Promise.resolve(null),
+  ]);
+
+  const productMap = new Map(products.map((p) => [String(p._id), p]));
+  const offerMap = new Map(offers.map((o) => [String(o._id), o]));
+  const now = new Date();
+
+  const formattedItems = [];
+  let subTotal = 0;
+  let taxTotal = 0;
+
+  for (const item of items) {
+    const id = item.id || item.menuItemId;
+    const qty = Math.max(1, Math.floor(Number(item.qty) || 1));
+    if (qty > 999) {
+      const err = new Error("Invalid quantity");
+      err.status = 400;
+      throw err;
+    }
+
+    const rawSize = item.size || "Standard";
+    const isExtraLine = /^extra$/i.test(String(rawSize));
+    const sizes = Array.isArray(item.sizes)
+      ? item.sizes.filter(Boolean)
+      : rawSize && rawSize !== "Standard" && !isExtraLine
+        ? String(rawSize)
+            .split(", ")
+            .filter(Boolean)
+        : [];
+    const sizeLabel = isExtraLine
+      ? "Extra"
+      : sizes.length > 0
+        ? sizes.join(", ")
+        : rawSize || "Standard";
+    let options = Array.isArray(item.options) ? item.options.filter(Boolean) : [];
+    const isOffer =
+      Boolean(item.isOffer) || /^offers?$/i.test(String(item.category || ""));
+
+    let unitPrice = 0;
+    let unitTax = 0;
+    let name = String(item.name || "").trim() || "Item";
+    let productCode = "";
+    let category = item.category || "ITEMS";
+    let productType = normalizeProductType(item.productType);
+    let inclusions = [];
+    let choices = [];
+    let drinks = [];
+    let choiceSelections = [];
+    let customDataSelections = [];
+    let addonChoiceSelections = [];
+    let customExtras = [];
+
+    if (isOffer) {
+      const offer = offerMap.get(String(id));
+      if (!offer) {
+        const err = new Error(`Offer not found or inactive: ${name}`);
+        err.status = 400;
+        throw err;
+      }
+      if (offer.validFrom && now < new Date(offer.validFrom)) {
+        const err = new Error(`Offer not yet valid: ${offer.name}`);
+        err.status = 400;
+        throw err;
+      }
+      if (offer.validTo && now > new Date(offer.validTo)) {
+        const err = new Error(`Offer expired: ${offer.name}`);
+        err.status = 400;
+        throw err;
+      }
+      unitPrice = Number(offer.price) || 0;
+      unitTax =
+        taxFromTaxData(offer.taxData, unitPrice) ||
+        taxFromTaxDocs(globalTaxes, unitPrice);
+      name = offer.name;
+      category = "Offers";
+      productType = "KITCHEN";
+      inclusions = filterOfferSelections(item.inclusions, offer.inclusions);
+      choices = filterOfferSelections(item.choices, offer.choices);
+      drinks = filterOfferSelections(item.drinks, offer.drinks);
+    } else {
+      const product = productMap.get(String(id));
+      if (!product) {
+        const err = new Error(`Product not found or inactive: ${name}`);
+        err.status = 400;
+        throw err;
+      }
+
+      if (isExtraLine) {
+        // Standalone addon line from POS options modal — price is addon only
+        unitPrice = resolveAddonOnlyPrice(product, options);
+        if (unitPrice <= 0 && options[0]) {
+          const err = new Error(`Addon not found on product: ${options[0]}`);
+          err.status = 400;
+          throw err;
+        }
+        const addonName = options[0];
+        const matchedAddon = (product.addons || []).find(
+          (addon) =>
+            String(addon?.name || "").toLowerCase() ===
+            String(addonName || "").toLowerCase(),
+        );
+        addonChoiceSelections = filterProductChoiceSelections(
+          item.addonChoiceSelections,
+          matchedAddon?.choiceOptions || [],
+        );
+        if (
+          matchedAddon &&
+          normalizeChoiceOptions(matchedAddon.choiceOptions).length > 0
+        ) {
+          const nestedCheck = validateAddonChoiceSelectionsAgainstLineQty({
+            addon: matchedAddon,
+            lineQty: qty,
+            addonChoiceSelections,
+            addonName: matchedAddon.name || addonName || "Addon",
+          });
+          if (!nestedCheck.ok) {
+            const err = new Error(
+              nestedCheck.errors[0]?.message ||
+                `Nested choices for ${matchedAddon.name || "addon"} must equal quantity ${qty}.`,
+            );
+            err.status = 400;
+            throw err;
+          }
+        }
+        name = matchedAddon?.name || addonName || product.name;
+        productCode = product.productCode || "";
+        category = item.category || "ITEMS";
+        productType = normalizeProductType(product.productType);
+      } else {
+        unitPrice =
+          resolveVariantUnitPrice(product, sizes) + addonExtra(product, options);
+
+        name = product.name;
+        productCode = product.productCode || "";
+        category = item.category || "ITEMS";
+        productType = normalizeProductType(product.productType);
+        choiceSelections = filterProductChoiceSelections(
+          item.choiceSelections,
+          resolveProductChoiceCatalog(product, item.size || sizes?.[0]),
+        );
+        customDataSelections = filterCustomDataSelections(
+          item.customDataSelections,
+          product.customData,
+        );
+        customExtras = normalizeCustomExtras(item.customExtras);
+        // Reject incomplete client rows (name without price / invalid)
+        if (Array.isArray(item.customExtras)) {
+          for (const raw of item.customExtras) {
+            const rawName = String(raw?.name || "").trim();
+            if (!rawName && (raw?.price === "" || raw?.price == null)) continue;
+            if (!rawName) {
+              const err = new Error("Custom item name is required");
+              err.status = 400;
+              throw err;
+            }
+            if (rawName.length > 80) {
+              const err = new Error(
+                "Custom item name is too long (max 80 characters)",
+              );
+              err.status = 400;
+              throw err;
+            }
+            const rawPrice = Number(raw?.price);
+            if (!Number.isFinite(rawPrice) || rawPrice < 0) {
+              const err = new Error(`Invalid custom item price for: ${rawName}`);
+              err.status = 400;
+              throw err;
+            }
+            if (raw?.qty != null && raw?.qty !== "") {
+              const rawQty = Math.floor(Number(raw.qty));
+              if (!Number.isFinite(rawQty) || rawQty < 1 || rawQty > 99) {
+                const err = new Error(
+                  `Invalid custom item qty for: ${rawName}`,
+                );
+                err.status = 400;
+                throw err;
+              }
+            }
+          }
+        }
+      }
+
+      const taxableUnit = unitPrice + customExtrasUnitTotal(customExtras);
+      if (product.taxData && (product.taxData.totalPercentage || product.taxData.totalFixed)) {
+        unitTax = taxFromTaxData(product.taxData, taxableUnit);
+      } else if (product.taxes?.length) {
+        unitTax = taxFromTaxDocs(product.taxes, taxableUnit);
+      } else {
+        unitTax = taxFromTaxDocs(globalTaxes, taxableUnit);
+      }
+    }
+
+    // Round price to cents; keep unit tax full-precision until the order total
+    // so we match Sales POS (sum line taxes, then round once). Rounding tax
+    // per line first can drift by 1¢ vs round(subtotal × rate).
+    unitPrice = r2(unitPrice);
+
+    formattedItems.push({
+      menuItemId: id,
+      name,
+      productCode,
+      category: isOffer ? "Offers" : category,
+      size: sizeLabel,
+      sizes: isExtraLine ? [] : sizes,
+      qty,
+      price: unitPrice,
+      tax: unitTax,
+      serviceCharge: 0,
+      options,
+      preparationStyle: item.preparationStyle || null,
+      productType,
+      isOffer,
+      customExtras,
+      inclusions,
+      choices,
+      choiceSelections,
+      customDataSelections,
+      addonChoiceSelections,
+      drinks,
+      notes: String(item.notes || "").trim(),
+      cartId: item.cartId || String(Date.now() + Math.random()),
+      seatNumber: (() => {
+        if (
+          item.seatNumber === undefined ||
+          item.seatNumber === null ||
+          item.seatNumber === "" ||
+          item.seatNumber === "table"
+        ) {
+          return null;
+        }
+        const n = Number(item.seatNumber);
+        return Number.isFinite(n) && n >= 1 ? Math.floor(n) : null;
+      })(),
+    });
+
+    subTotal += (unitPrice + customExtrasUnitTotal(customExtras)) * qty;
+    taxTotal += unitTax * qty;
+  }
+
+  subTotal = r2(subTotal);
+  taxTotal = r2(taxTotal);
+
+  let discountTotal = 0;
+  let resolvedDiscountCode = null;
+  let resolvedDiscountPercent = null;
+  const staffPercent = normalizeStaffDiscountPercent(staffDiscountPercent);
+  if (staffPercent > 0) {
+    discountTotal = Math.min(
+      calcStaffDiscountAmount(subTotal, staffPercent),
+      subTotal,
+    );
+    resolvedDiscountCode = STAFF_DISCOUNT_CODE;
+    resolvedDiscountPercent = staffPercent;
+  } else if (discountCode) {
+    const code = String(discountCode).trim().toUpperCase();
+    const coupon = await Coupon.findOne({
+      restaurant: restaurantId,
+      code,
+      status: "Active",
+    }).lean();
+    if (!coupon) {
+      const err = new Error("Invalid or inactive discount code");
+      err.status = 400;
+      throw err;
+    }
+    if (coupon.validFrom && now < new Date(coupon.validFrom)) {
+      const err = new Error("Discount code is not active yet");
+      err.status = 400;
+      throw err;
+    }
+    if (coupon.validUntil && now > new Date(coupon.validUntil)) {
+      const err = new Error("Discount code has expired");
+      err.status = 400;
+      throw err;
+    }
+    if (coupon.discountType === "percent") {
+      resolvedDiscountPercent = Number(coupon.value) || 0;
+      discountTotal = r2((subTotal * (Number(coupon.value) || 0)) / 100);
+    } else {
+      discountTotal = r2(Number(coupon.value) || 0);
+      if (subTotal > 0 && discountTotal > 0) {
+        resolvedDiscountPercent = Math.round((discountTotal / subTotal) * 1000) / 10;
+      }
+    }
+    discountTotal = Math.min(discountTotal, subTotal);
+    resolvedDiscountCode = coupon.code;
+  }
+
+  // Prorate sales tax if a discount is applied (tax is charged on net sales in POS)
+  if (discountTotal > 0 && subTotal > 0) {
+    const taxableRatio = Math.max(0, subTotal - discountTotal) / subTotal;
+    taxTotal = r2(taxTotal * taxableRatio);
+    for (const item of formattedItems) {
+      item.tax = r2(item.tax * taxableRatio);
+    }
+  }
+
+  let serviceChargeTotal = 0;
+  let serviceChargeName = null;
+  if (applyServiceCharge && serviceTax) {
+    serviceChargeTotal = computeOrderServiceCharge({
+      serviceTax,
+      subtotal: subTotal,
+      discountAmount: discountTotal,
+    });
+    serviceChargeName = serviceTax.name || "Server Charge";
+  }
+
+  const totalAmount = r2(
+    Math.max(0, subTotal - discountTotal + taxTotal + serviceChargeTotal),
+  );
+
+  return {
+    formattedItems,
+    subTotal,
+    taxTotal,
+    serviceChargeTotal,
+    serviceChargeName,
+    discountTotal,
+    discountCode: resolvedDiscountCode,
+    discountPercent: resolvedDiscountPercent,
+    totalAmount,
+  };
+}

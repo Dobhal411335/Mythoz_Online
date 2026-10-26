@@ -1,0 +1,127 @@
+import { decodeJwt } from 'jose';
+import EmployeeSession from '@/models/employee/EmployeeSession';
+import Employee from '@/models/employee/Employee';
+import { signToken, verifyToken } from '@/utils/jwt';
+import { finalizeAttendanceOnClockOut } from '@/lib/attendance';
+
+/** Matches login + withEmployeeAuth: Active or Approved employees may hold a session. */
+export function isEmployeeEligibleForSession(employee) {
+  return Boolean(
+    employee?.isActive &&
+      (employee.status === 'Active' || employee.status === 'Approved')
+  );
+}
+
+export async function expireAndFinalizeSession(session, logoutTime = new Date(), status = 'Expired') {
+  if (!session || session.status !== 'Active') return session;
+  const loginMs = session.loginTime
+    ? new Date(session.loginTime).getTime()
+    : logoutTime.getTime();
+  session.logoutTime = logoutTime;
+  session.duration = Math.max(0, Math.floor((logoutTime.getTime() - loginMs) / 1000));
+  session.status = status;
+  await session.save();
+  await finalizeAttendanceOnClockOut({ session, logoutTime });
+  return session;
+}
+
+export async function markEmployeeSessionExpired(sessionId) {
+  if (!sessionId) return null;
+  const session = await EmployeeSession.findOne({ _id: sessionId, status: 'Active' });
+  if (!session) return null;
+  return expireAndFinalizeSession(session, new Date(), 'Expired');
+}
+
+/**
+ * Expire every Active login session for a restaurant.
+ * Does not touch RegisteredDevice, device tokens, or employee records.
+ */
+export async function expireAllRestaurantSessions(restaurantId) {
+  if (!restaurantId) return { count: 0, sessions: [] };
+
+  const sessions = await EmployeeSession.find({
+    restaurant: restaurantId,
+    status: 'Active',
+  });
+
+  const logoutTime = new Date();
+  const expired = [];
+
+  for (const session of sessions) {
+    await expireAndFinalizeSession(session, logoutTime, 'Expired');
+    expired.push(session);
+  }
+
+  return { count: expired.length, sessions: expired };
+}
+
+export async function expireSessionFromRefreshToken(refreshToken) {
+  if (!refreshToken) return;
+  try {
+    const payload = decodeJwt(refreshToken);
+    if (payload?.sessionId) {
+      await markEmployeeSessionExpired(payload.sessionId);
+    }
+  } catch {
+    // Ignore malformed tokens
+  }
+}
+
+/**
+ * Validates refresh token and issues a new access + rotated refresh token.
+ */
+export async function refreshEmployeeAccessToken(refreshToken) {
+  if (!refreshToken) {
+    return { ok: false, status: 401, message: 'Refresh token missing', expireSession: false };
+  }
+
+  const payload = await verifyToken(refreshToken);
+  if (!payload || payload.type !== 'refresh') {
+    // Do not expire the DB session from an unverified token (e.g. JWT_SECRET mismatch after deploy).
+    return { ok: false, status: 401, message: 'Invalid or expired refresh token', expireSession: true };
+  }
+
+  const session = await EmployeeSession.findById(payload.sessionId);
+  if (!session || session.status !== 'Active') {
+    return { ok: false, status: 401, message: 'Session expired or terminated', expireSession: true };
+  }
+
+  const currentVersion = session.refreshTokenVersion || 1;
+  const tokenVersion = payload.version != null ? Number(payload.version) : 1;
+  if (tokenVersion !== Number(currentVersion)) {
+    await markEmployeeSessionExpired(session._id);
+    return { ok: false, status: 401, message: 'Refresh token reused or revoked', expireSession: true };
+  }
+
+  const employee = await Employee.findById(payload.employeeId);
+  if (!isEmployeeEligibleForSession(employee)) {
+    await markEmployeeSessionExpired(session._id);
+    return { ok: false, status: 403, message: 'Account suspended or inactive', expireSession: true };
+  }
+
+  session.refreshTokenVersion = currentVersion + 1;
+  await session.save();
+
+  const accessToken = await signToken(
+    {
+      employeeId: employee._id.toString(),
+      restaurantId: employee.restaurant.toString(),
+      sessionId: session._id.toString(),
+      role: employee.role,
+      type: 'access',
+    },
+    '1h'
+  );
+
+  const newRefreshToken = await signToken(
+    {
+      employeeId: employee._id.toString(),
+      sessionId: session._id.toString(),
+      type: 'refresh',
+      version: session.refreshTokenVersion,
+    },
+    '7d'
+  );
+
+  return { ok: true, accessToken, refreshToken: newRefreshToken, session, employee };
+}

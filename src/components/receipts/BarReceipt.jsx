@@ -1,0 +1,218 @@
+import React from "react";
+import "./print.css";
+import moment from "moment";
+import {
+  isDirectSaleOrder,
+  formatTableNumbersWithFloor,
+  getOrderTypeLabel,
+} from "@/utils/orderDisplay";
+import { getReceiptModifierLines } from "@/utils/productChoices";
+
+/**
+ * Hardware-independent Bar / Counter ticket for small thermal printers.
+ * Intentionally omits prices, tax, and payment info.
+ */
+const BarReceipt = ({
+  order,
+  barItems = [],
+  restaurantName,
+  serverName,
+  guestCount,
+  specialNote,
+  isReprint = false,
+}) => {
+  const items = barItems?.length ? barItems : (order?.items || []);
+  if (!order || !items.length) {
+    return (
+      <div
+        className="thermal-receipt receipt-font p-6 bg-white text-black text-center"
+        style={{ width: "var(--print-width, 80mm)" }}
+      >
+        <div className="text-[11px] receipt-bold uppercase mb-1">
+          {restaurantName || order?.restaurantName || "TASTY BITES"}
+        </div>
+        <h1 className="text-sm receipt-bold underline mb-2 uppercase">Bar Receipt</h1>
+        <p className="text-xs text-zinc-500 font-medium">No items found for this bar ticket.</p>
+      </div>
+    );
+  }
+
+  const { orderNumber, tableNo, guestName, partyName, createdAt } = order;
+  const tableLabel = formatTableNumbersWithFloor(
+    tableNo,
+    order.floorName || order.floor?.name,
+  );
+  const note = specialNote || order.specialNote;
+  const orderTypeLabel = getOrderTypeLabel(order);
+  const partyLabel =
+    partyName || guestName || (isDirectSaleOrder(order) ? orderTypeLabel : "");
+  const directSale = isDirectSaleOrder(order);
+  const covers =
+    guestCount != null && guestCount !== ""
+      ? Number(guestCount)
+      : order?.guestCount != null && order.guestCount !== ""
+        ? Number(order.guestCount)
+        : null;
+  const brand = restaurantName || "TASTY BITES";
+
+  return (
+    <div
+      className="thermal-receipt receipt-font p-3 bg-white text-black"
+      style={{ width: "var(--print-width, 80mm)" }}
+    >
+      <div className="text-center mb-2">
+        <div className="text-[14px] receipt-bold uppercase mb-1">
+          {brand}
+        </div>
+        <h1 className="text-base receipt-bold underline mb-1 uppercase">
+          Bar Receipt
+        </h1>
+        {isReprint && (
+          <div className="text-[10px] receipt-bold uppercase text-center mb-1">
+            *** REPRINT ***
+          </div>
+        )}
+        <div className="text-[11px] receipt-bold uppercase tracking-wide">
+          {orderTypeLabel}
+        </div>
+      </div>
+
+      <div className="text-left text-[12px] space-y-0.5 mb-2">
+        {(partyLabel || covers != null) && (
+          <div className="receipt-bold uppercase">
+            Party: {partyLabel || covers}
+            {covers != null && partyLabel ? ` (${covers})` : ""}
+          </div>
+        )}
+        {!directSale && (
+          <div className="receipt-bold uppercase">
+            Table: {tableLabel || orderTypeLabel}
+          </div>
+        )}
+      </div>
+
+      <div className="receipt-divider border-t border-black border-solid my-2" />
+
+      <div className="text-left text-[11px] space-y-0.5 mb-3">
+        <div>
+          <span className="receipt-bold">Sent:</span>{" "}
+          {moment(createdAt || undefined).format("MMM DD, YYYY [at] hh:mm A")}
+        </div>
+        {!directSale && tableLabel && (
+          <div>
+            <span className="receipt-bold">Table:</span> {tableLabel}
+            {covers != null ? `, ${covers} Cover${covers === 1 ? "" : "s"}` : ""}
+          </div>
+        )}
+        <div>
+          <span className="receipt-bold">Order:</span> {orderNumber}
+        </div>
+        <div>
+          <span className="receipt-bold">Order type:</span> {orderTypeLabel}
+        </div>
+        {partyLabel && (
+          <div>
+            <span className="receipt-bold">Party Name:</span> {partyLabel}
+          </div>
+        )}
+        {serverName && (
+          <div>
+            <span className="receipt-bold">Server:</span> {serverName}
+          </div>
+        )}
+      </div>
+
+      {note && (
+        <>
+          <div className="receipt-divider border-t border-black border-dashed my-2" />
+          <div className="p-2 border-2 border-black border-dashed rounded text-xs bg-zinc-50 mb-2">
+            <div className="receipt-bold uppercase text-[10px] tracking-wider mb-0.5">
+              SPECIAL INSTRUCTIONS / NOTES:
+            </div>
+            <div className="receipt-bold text-xs">{note}</div>
+          </div>
+        </>
+      )}
+
+      <div className="receipt-divider border-t-2 border-black border-solid mb-2" />
+
+      <div className="receipt-bold uppercase text-xs mb-2">Drinks</div>
+
+      <div className="text-sm space-y-3 mb-2">
+        {items.map((item, itemIdx) => {
+          const modifierLines = getReceiptModifierLines(item);
+          const seatBits = [];
+          if (item.seat != null && item.seat !== "") seatBits.push(item.seat);
+          else if (item.seatNumber != null && item.seatNumber !== "") {
+            seatBits.push(item.seatNumber);
+          }
+          if (Array.isArray(item.seats)) {
+            item.seats.filter(Boolean).forEach((s) => seatBits.push(s));
+          }
+
+          return (
+            <div key={itemIdx}>
+              <div className="flex items-start text-xs">
+                <span className="receipt-bold mr-2 whitespace-nowrap">
+                  {item.qty} x
+                </span>
+                <span className="receipt-bold leading-tight">
+                  {item.productCode ? `${item.productCode} ` : ""}
+                  {item.name || item.productName || "Item"}
+                  {item.size && item.size !== "Standard"
+                    ? ` (${item.size})`
+                    : ""}
+                  {seatBits.length > 0
+                    ? ` (${seatBits.map((s) => `S${String(s).replace(/^S/i, "")}`).join(", ")})`
+                    : ""}
+                </span>
+              </div>
+              {item.course && (
+                <div className="pl-7 text-[10px] italic">
+                  Course: {item.course}
+                </div>
+              )}
+              {modifierLines.length > 0 && (
+                <div className="pl-7 mt-0.5 space-y-0.5">
+                  {modifierLines.map((line, lineIdx) => (
+                    <div
+                      key={`${line.kind}-${lineIdx}`}
+                      className={`text-[11px] font-semibold ${
+                        line.kind === "addon-choice-item" ||
+                        line.kind === "choice-item" ||
+                        line.kind === "custom-data-item"
+                          ? "pl-2"
+                          : line.kind === "custom-extra"
+                            ? "flex justify-between gap-2 not-italic"
+                            : "italic"
+                      }`}
+                    >
+                      <span>{line.text}</span>
+                      {line.kind === "custom-extra" && line.price != null ? (
+                        <span className="shrink-0">
+                          +${Number(line.price).toFixed(2)}
+                        </span>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {(item.notes || item.specialInstructions) && (
+                <div className="pl-7 mt-0.5 text-[10px] italic receipt-bold text-zinc-800">
+                  Note: {item.notes || item.specialInstructions}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="receipt-divider border-t-2 border-black border-solid mt-3 mb-1" />
+      <div className="text-center text-[10px] mt-1 italic">
+        *** BAR #{orderNumber} ***
+      </div>
+    </div>
+  );
+};
+
+export default BarReceipt;

@@ -1,0 +1,1102 @@
+import PrintJob from "@/models/PrintJob";
+import Order from "@/models/Order";
+import PrinterConfig from "@/models/PrinterConfig";
+import { getPrinterAdapter } from "./getPrinterAdapter";
+import { logger } from "@/utils/logger";
+import { sendError } from "@/utils/errorHandler";
+import { createNotification } from "@/lib/notifications/notificationService";
+import {
+  DEFAULT_RESTAURANT_TIMEZONE,
+  todayRestaurantISO,
+} from "@/lib/restaurantTime";
+import { businessDateBounds } from "@/lib/eod/eodHelpers";
+import {
+  isSeatBasedPaymentSplits,
+  normalizeSeatNumber,
+} from "@/lib/orders/seatHelpers";
+
+/** Roles that may administer the print queue (not plain floor EMPLOYEE). */
+export const SALES_PRINT_ROLES = [
+  "ADMIN",
+  "SUPER ADMIN",
+  "MASTER TERMINAL",
+  "MANAGER",
+  "MANAGER TERMINAL",
+  "SERVER",
+  "BARTENDER",
+  "STAFF",
+  "EMPLOYEE",
+  "WAIT STAFF",
+];
+
+const PRINT_ADMIN_ALLOW = new Set([
+  "ADMIN",
+  "SUPER ADMIN",
+  "MASTER TERMINAL",
+  "MANAGER",
+  "MANAGER TERMINAL",
+  "SERVER",
+  "BARTENDER",
+  "EMPLOYEE",
+  "STAFF",
+  "WAIT STAFF",
+]);
+
+/**
+ * Extra gate: withAuth expands SERVER → EMPLOYEE/STAFF;
+ * printer administration stays limited to sales/admin roles.
+ */
+export function assertPrintAdminRole(role) {
+  const upper = (role || "").toUpperCase();
+  if (!PRINT_ADMIN_ALLOW.has(upper)) {
+    return sendError(
+      new Error("Forbidden"),
+      "Printer administration requires sales/admin access",
+      403
+    );
+  }
+  return null;
+}
+
+/** Soft-deleted order jobs must not print, retry, or reprint. */
+function assertPrintJobActive(job) {
+  if (job?.isActive === false) {
+    throw Object.assign(
+      new Error("Print job is inactive (order was soft-deleted)"),
+      { statusCode: 404 }
+    );
+  }
+}
+
+/**
+ * Compact payload for Socket.IO — no sensitive payment details.
+ */
+export function toPrintJobEventPayload(job, orderNumber, printerConfig = null) {
+  const plain = typeof job.toObject === "function" ? job.toObject() : job;
+  const cfg = printerConfig || null;
+  return {
+    printJobId: String(plain._id),
+    orderId: String(plain.orderId),
+    orderNumber: orderNumber || plain.metadata?.orderNumber || null,
+    printType: plain.printType,
+    printerTarget: plain.printerTarget,
+    printerId: plain.printerId
+      ? String(plain.printerId)
+      : cfg?._id
+        ? String(cfg._id)
+        : null,
+    connectionType: cfg?.connectionType || null,
+    systemPrinterName: cfg?.systemPrinterName || null,
+    bluetoothAddress: cfg?.bluetoothAddress || null,
+    usbVendorId: cfg?.usbVendorId ?? null,
+    usbProductId: cfg?.usbProductId ?? null,
+    paperWidthMm: cfg?.paperWidthMm ?? null,
+    status: plain.status,
+    attemptCount: plain.attemptCount || 0,
+    createdAt: plain.createdAt,
+    errorMessage: plain.errorMessage || null,
+    tableNo: plain.metadata?.tableNo || null,
+    parentPrintJobId: plain.parentPrintJobId
+      ? String(plain.parentPrintJobId)
+      : null,
+    isReprint: Boolean(plain.parentPrintJobId || plain.metadata?.isReprint),
+  };
+}
+
+/**
+ * Resolve which printer should handle a job.
+ * - Exactly one enabled printer → use it for all targets (single-printer shops)
+ * - Multiple → match by printerTarget (KITCHEN / COUNTER / RECEIPT)
+ */
+async function resolvePrinterConfig(restaurantId, printerTarget) {
+  if (!restaurantId) return null;
+  const enabled = await PrinterConfig.find({
+    restaurant: restaurantId,
+    enabled: true,
+  }).lean();
+  if (!enabled.length) return null;
+  if (enabled.length === 1) return enabled[0];
+  if (!printerTarget) return null;
+  return enabled.find((p) => p.target === printerTarget) || null;
+}
+
+
+function emitPrintEvent(eventName, restaurantId, floorId, payload) {
+  if (!global.io) return;
+  if (floorId) {
+    global.io.to(`floor:${floorId}`).emit(eventName, payload);
+  }
+  if (restaurantId) {
+    global.io.to(`restaurant:${restaurantId}`).emit(eventName, payload);
+  }
+}
+
+/**
+ * Create a PrintJob if one with the same idempotencyKey does not already exist.
+ */
+export async function createPrintJob({
+  restaurantId,
+  orderId,
+  printType,
+  printerTarget,
+  requestedBy,
+  metadata = {},
+  idempotencyKey,
+  floorId,
+  orderNumber,
+}) {
+  if (idempotencyKey) {
+    const existing = await PrintJob.findOne({ restaurantId, idempotencyKey });
+    if (existing) {
+      return { job: existing, created: false };
+    }
+  }
+
+  const printerConfig = await resolvePrinterConfig(restaurantId, printerTarget);
+
+  try {
+    const job = await PrintJob.create({
+      restaurantId,
+      orderId,
+      printType,
+      printerTarget,
+      printerId: printerConfig?._id || null,
+      status: "QUEUED",
+      attemptCount: 0,
+      requestedBy: requestedBy || null,
+      metadata: {
+        ...metadata,
+        orderNumber: orderNumber || metadata.orderNumber || null,
+      },
+      idempotencyKey: idempotencyKey || undefined,
+    });
+
+    const payload = toPrintJobEventPayload(job, orderNumber, printerConfig);
+    emitPrintEvent("NEW_PRINT_JOB", restaurantId, floorId, payload);
+
+    logger.info(
+      `PrintJob created: ${job._id} type=${printType} order=${orderNumber || orderId}`
+    );
+
+    return { job, created: true };
+  } catch (err) {
+    // Race on unique idempotencyKey
+    if (err?.code === 11000 && idempotencyKey) {
+      const existing = await PrintJob.findOne({ restaurantId, idempotencyKey });
+      if (existing) return { job: existing, created: false };
+    }
+    throw err;
+  }
+}
+
+export async function createKotPrintJob({
+  order,
+  kotItems,
+  requestedBy,
+  guestCount,
+  serverName,
+  restaurantName,
+  specialNote,
+  floorName,
+}) {
+  if (!kotItems || kotItems.length === 0) {
+    return { job: null, created: false };
+  }
+
+  const itemSig = kotItems
+    .map((i) => `${i.cartId || i.menuItemId || i.name}:${i.qty}`)
+    .sort()
+    .join("|");
+  const idempotencyKey = `kot:${order._id}:${itemSig}`;
+
+  return createPrintJob({
+    restaurantId: order.restaurantId,
+    orderId: order._id,
+    printType: "KOT",
+    printerTarget: "KITCHEN",
+    requestedBy,
+    floorId: order.floor,
+    orderNumber: order.orderNumber,
+    idempotencyKey,
+    metadata: {
+      kotItems,
+      specialNote: specialNote || order.specialNote || null,
+      guestCount: guestCount ?? null,
+      tableNo: order.tableNo || null,
+      guestName: order.guestName || null,
+      partyName: order.partyName || order.guestName || null,
+      floorName: floorName || order.floorName || null,
+      serverName: serverName || null,
+      restaurantName: restaurantName || null,
+      orderNumber: order.orderNumber,
+    },
+  });
+}
+
+export async function createBarReceiptPrintJob({
+  order,
+  barItems,
+  requestedBy,
+  guestCount,
+  serverName,
+  restaurantName,
+  specialNote,
+  floorName,
+}) {
+  if (!barItems || barItems.length === 0) {
+    return { job: null, created: false };
+  }
+
+  const itemSig = barItems
+    .map((i) => `${i.cartId || i.menuItemId || i.name}:${i.qty}`)
+    .sort()
+    .join("|");
+  const idempotencyKey = `bar:${order._id}:${itemSig}`;
+
+  return createPrintJob({
+    restaurantId: order.restaurantId,
+    orderId: order._id,
+    printType: "BAR_RECEIPT",
+    printerTarget: "COUNTER",
+    requestedBy,
+    floorId: order.floor,
+    orderNumber: order.orderNumber,
+    idempotencyKey,
+    metadata: {
+      kotItems: barItems,
+      barItems,
+      specialNote: specialNote || order.specialNote || null,
+      guestCount: guestCount ?? null,
+      tableNo: order.tableNo || null,
+      guestName: order.guestName || null,
+      partyName: order.partyName || order.guestName || null,
+      floorName: floorName || order.floorName || null,
+      serverName: serverName || null,
+      restaurantName: restaurantName || null,
+      orderNumber: order.orderNumber,
+    },
+  });
+}
+
+export async function createReceiptPrintJob({
+  order,
+  requestedBy,
+  guestCount,
+  serverName,
+  restaurantName,
+  floorName,
+}) {
+  // One active/success receipt job per paid order (retry reuses FAILED).
+  // Named multi-payer splits use createSplitReceiptPrintJobs instead.
+  const hasNamedSplits =
+    Array.isArray(order.paymentSplits) && order.paymentSplits.length > 1;
+  if (!hasNamedSplits) {
+    const existing = await PrintJob.findOne({
+      orderId: order._id,
+      printType: "RECEIPT",
+      status: { $in: ["QUEUED", "PRINTING", "PRINTED"] },
+    });
+    if (existing) {
+      return { job: existing, created: false };
+    }
+  }
+
+  const idempotencyKey = `receipt:${order._id}:paid`;
+
+  return createPrintJob({
+    restaurantId: order.restaurantId,
+    orderId: order._id,
+    printType: "RECEIPT",
+    printerTarget: "RECEIPT",
+    requestedBy,
+    floorId: order.floor,
+    orderNumber: order.orderNumber,
+    idempotencyKey,
+    metadata: {
+      guestCount: guestCount ?? null,
+      tableNo: order.tableNo || null,
+      guestName: order.guestName || null,
+      partyName: order.partyName || order.guestName || null,
+      floorName: floorName || order.floorName || null,
+      serverName: serverName || null,
+      restaurantName: restaurantName || null,
+      orderNumber: order.orderNumber,
+      paymentMethod: order.paymentMethod || null,
+      cashAmount: order.cashAmount ?? null,
+      cardAmount: order.cardAmount ?? null,
+      giftcardUsedAmount: order.giftcardUsedAmount ?? null,
+      tipAmount: order.tipAmount ?? null,
+      tipMethod: order.tipMethod ?? null,
+      serviceChargeTotal: order.serviceChargeTotal ?? null,
+      serviceChargeName: order.serviceChargeName ?? null,
+      discountTotal: order.discountTotal ?? null,
+      discountPercent: order.discountPercent ?? null,
+      subTotal: order.subTotal ?? null,
+      taxTotal: order.taxTotal ?? null,
+      totalAmount: order.totalAmount ?? null,
+    },
+  });
+}
+
+/**
+ * One RECEIPT PrintJob per named payment split (same orderNumber, multi slips).
+ */
+export async function createSplitReceiptPrintJobs({
+  order,
+  requestedBy,
+  guestCount,
+  serverName,
+  restaurantName,
+  floorName,
+}) {
+  const rawSplits = Array.isArray(order.paymentSplits) ? order.paymentSplits : [];
+  const splits = rawSplits.map((s) =>
+    s && typeof s.toObject === "function" ? s.toObject() : s,
+  );
+  if (splits.length < 1) {
+    const result = await createReceiptPrintJob({
+      order,
+      requestedBy,
+      guestCount,
+      serverName,
+      restaurantName,
+      floorName,
+    });
+    return {
+      jobs: result.job ? [result.job] : [],
+      created: result.created,
+    };
+  }
+
+  const billTotal = Number(order.totalAmount) || 0;
+  const baseMeta = {
+    guestCount: guestCount ?? null,
+    tableNo: order.tableNo || null,
+    guestName: order.guestName || null,
+    partyName: order.partyName || order.guestName || null,
+    floorName: floorName || order.floorName || null,
+    serverName: serverName || null,
+    restaurantName: restaurantName || null,
+    orderNumber: order.orderNumber,
+    // Per-slip tip overrides these; keep order totals for non-split context
+    tipAmount: null,
+    tipMethod: null,
+    serviceChargeTotal: order.serviceChargeTotal ?? null,
+    serviceChargeName: order.serviceChargeName ?? null,
+    discountTotal: order.discountTotal ?? null,
+    discountPercent: order.discountPercent ?? null,
+    subTotal: order.subTotal ?? null,
+    taxTotal: order.taxTotal ?? null,
+    totalAmount: billTotal,
+    billTotal,
+    orderPaymentMethod: order.paymentMethod || null,
+    orderCashAmount: order.cashAmount ?? null,
+    orderCardAmount: order.cardAmount ?? null,
+    orderGiftcardUsedAmount: order.giftcardUsedAmount ?? null,
+    orderTipAmount: order.tipAmount ?? null,
+  };
+
+  const filterReceiptBySeat = isSeatBasedPaymentSplits(
+    splits,
+    order.items || [],
+  );
+
+  const jobs = [];
+  for (let i = 0; i < splits.length; i++) {
+    const split = splits[i] || {};
+    const methodRaw = String(split.method || "Cash").trim();
+    const amount = Number(split.amount) || 0;
+    const tipAmt = Number(split.tipAmount) || 0;
+    const cashAmt =
+      split.cashAmount != null && split.cashAmount !== ""
+        ? Number(split.cashAmount) || 0
+        : /^cash$/i.test(methodRaw) && !/card/i.test(methodRaw)
+          ? amount + tipAmt
+          : 0;
+    const cardAmt =
+      split.cardAmount != null && split.cardAmount !== ""
+        ? Number(split.cardAmount) || 0
+        : /card/i.test(methodRaw) && !/^cash$/i.test(methodRaw)
+          ? amount + tipAmt
+          : /card/i.test(methodRaw) && /cash/i.test(methodRaw)
+            ? Math.max(0, amount + tipAmt - cashAmt)
+            : 0;
+    const cardType = split.cardType ? String(split.cardType).trim() : null;
+    const hasCash = cashAmt > 0;
+    const hasCard = cardAmt > 0;
+    let splitMethod = methodRaw;
+    if (hasCash && hasCard) {
+      splitMethod = cardType ? `Card - ${cardType} + Cash` : "Cash + Card";
+    } else if (hasCard) {
+      splitMethod = cardType ? `Card - ${cardType}` : "Card";
+    } else {
+      splitMethod = "Cash";
+    }
+    const splitName = String(split.name || `Guest ${i + 1}`).trim();
+    const seatNumbers = Array.isArray(split.seatNumbers)
+      ? split.seatNumbers
+          .map((n) => normalizeSeatNumber(n))
+          .filter((n, idx, arr) => arr.indexOf(n) === idx)
+      : split.seatNumber != null
+        ? [normalizeSeatNumber(split.seatNumber)]
+        : [];
+    const idempotencyKey = `receipt:${order._id}:split:${i}`;
+    const existing = await PrintJob.findOne({
+      restaurantId: order.restaurantId,
+      idempotencyKey,
+    });
+    if (existing) {
+      jobs.push(existing);
+      continue;
+    }
+    const { job } = await createPrintJob({
+      restaurantId: order.restaurantId,
+      orderId: order._id,
+      printType: "RECEIPT",
+      printerTarget: "RECEIPT",
+      requestedBy,
+      floorId: order.floor,
+      orderNumber: order.orderNumber,
+      idempotencyKey,
+      metadata: {
+        ...baseMeta,
+        isSplitReceipt: true,
+        splitIndex: i + 1,
+        splitTotal: splits.length,
+        splitName,
+        splitAmount: amount,
+        splitMethod,
+        splitCardType: cardType,
+        // Each slip’s Party line uses this payer’s name
+        guestName: splitName,
+        partyName: splitName,
+        // Slip-specific tender (overrides order aggregates for this job)
+        paymentMethod: splitMethod,
+        cashAmount: cashAmt,
+        cardAmount: cardAmt,
+        tipAmount: tipAmt > 0 ? tipAmt : 0,
+        tipMethod: tipAmt > 0 ? split.tipMethod || null : null,
+        giftcardUsedAmount: 0,
+        ...(filterReceiptBySeat
+          ? {
+              filterReceiptBySeat: true,
+              splitSeatNumber:
+                seatNumbers.length === 1
+                  ? seatNumbers[0]
+                  : normalizeSeatNumber(split.seatNumber),
+              splitSeatNumbers: seatNumbers.length ? seatNumbers : undefined,
+            }
+          : {}),
+      },
+    });
+    if (job) jobs.push(job);
+  }
+
+  return { jobs, created: true };
+}
+
+async function persistStatus(job, updates, floorId) {
+  Object.assign(job, updates);
+  await job.save();
+
+  const orderNumber = job.metadata?.orderNumber;
+  let printerConfig = null;
+  if (job.printerId) {
+    printerConfig = await PrinterConfig.findById(job.printerId).lean();
+  } else if (job.printerTarget) {
+    printerConfig = await resolvePrinterConfig(job.restaurantId, job.printerTarget);
+  }
+  const payload = toPrintJobEventPayload(job, orderNumber, printerConfig);
+  emitPrintEvent("PRINT_JOB_UPDATED", job.restaurantId, floorId || null, payload);
+  return job;
+}
+
+/**
+ * Run the configured printer adapter against a job (mock today).
+ */
+export async function executePrintJob(jobId, { simulateFailure = false, restaurantId } = {}) {
+  const job = await PrintJob.findById(jobId);
+  if (!job) {
+    throw Object.assign(new Error("Print job not found"), { statusCode: 404 });
+  }
+  if (restaurantId && String(job.restaurantId) !== String(restaurantId)) {
+    throw Object.assign(new Error("Forbidden"), { statusCode: 403 });
+  }
+  assertPrintJobActive(job);
+
+  let floorId = null;
+  const order = await Order.findById(job.orderId).lean();
+  if (order?.isActive === false) {
+    throw Object.assign(
+      new Error("Cannot print a soft-deleted order"),
+      { statusCode: 400 }
+    );
+  }
+  if (order?.floor) floorId = order.floor;
+
+  await persistStatus(
+    job,
+    {
+      status: "PRINTING",
+      startedAt: new Date(),
+      attemptCount: (job.attemptCount || 0) + 1,
+      errorMessage: null,
+    },
+    floorId
+  );
+
+  const adapter = getPrinterAdapter();
+  const result = await adapter.print(job, { simulateFailure, order });
+
+  // Never treat simulated/blocked server adapters as physical success in production.
+  if (result.simulated && result.blocked) {
+    await persistStatus(
+      job,
+      {
+        status: "QUEUED",
+        errorMessage: result.error || "Waiting for on-site print agent",
+      },
+      floorId
+    );
+    return {
+      job,
+      result: {
+        ...result,
+        success: false,
+      },
+    };
+  }
+
+  if (!result.success) {
+    await persistStatus(
+      job,
+      {
+        status: "FAILED",
+        failedAt: new Date(),
+        errorMessage: result.error || "Print failed",
+      },
+      floorId
+    );
+
+    try {
+      await createNotification({
+        restaurantId: job.restaurantId,
+        type: "PRINT_FAILED",
+        title: "Print Failed",
+        message: `${job.printType} print failed for Order #${job.metadata?.orderNumber || order?.orderNumber || ""}`,
+        orderId: job.orderId,
+        printJobId: job._id,
+        floorId,
+        metadata: {
+          orderNumber: job.metadata?.orderNumber || order?.orderNumber || null,
+          printType: job.printType,
+          printerTarget: job.printerTarget,
+          error: result.error || "Print failed",
+        },
+      });
+    } catch (notifErr) {
+      logger.error("Failed to create PRINT_FAILED notification", notifErr);
+    }
+
+    return { job, result };
+  }
+
+  await persistStatus(
+    job,
+    {
+      status: "PRINTED",
+      printedAt: new Date(),
+      errorMessage: null,
+    },
+    floorId
+  );
+
+  return { job, result };
+}
+
+/**
+ * Cancel leftover QUEUED / stuck PRINTING jobs from before the restaurant-local
+ * business day so overnight agents never print yesterday's queue.
+ * Jobs intentionally requeued today (metadata.requeuedAt) are kept.
+ */
+export async function expireStaleQueuedPrintJobs(restaurantId) {
+  if (!restaurantId) return { expired: 0 };
+
+  const tz = DEFAULT_RESTAURANT_TIMEZONE;
+  const today = todayRestaurantISO(tz);
+  const { start } = businessDateBounds(today, tz);
+
+  const result = await PrintJob.updateMany(
+    {
+      restaurantId,
+      isActive: { $ne: false },
+      status: { $in: ["QUEUED", "PRINTING"] },
+      $expr: {
+        $lt: [{ $ifNull: ["$metadata.requeuedAt", "$createdAt"] }, start],
+      },
+    },
+    {
+      $set: {
+        status: "CANCELLED",
+        errorMessage: "Expired — left unprinted from a previous day",
+      },
+    }
+  );
+
+  const expired = result.modifiedCount || 0;
+  if (expired > 0) {
+    logger.info("Expired stale print jobs from prior business day", {
+      restaurantId: String(restaurantId),
+      expired,
+      businessDate: today,
+    });
+  }
+
+  return { expired, businessDate: today, dayStart: start };
+}
+
+/** True when a job is still eligible to print on the current restaurant day. */
+export function isPrintJobEligibleToday(job, dayStart = null) {
+  if (!job) return false;
+  const start =
+    dayStart ||
+    businessDateBounds(todayRestaurantISO(DEFAULT_RESTAURANT_TIMEZONE))
+      .start;
+  const effective =
+    job.metadata?.requeuedAt != null
+      ? new Date(job.metadata.requeuedAt)
+      : new Date(job.createdAt);
+  return !Number.isNaN(effective.getTime()) && effective >= start;
+}
+
+/**
+ * Reset a failed (or any) job back to QUEUED and optionally re-run.
+ */
+export async function retryPrintJob(jobId, { runNow = false, simulateFailure = false, restaurantId } = {}) {
+  const job = await PrintJob.findById(jobId);
+  if (!job) {
+    throw Object.assign(new Error("Print job not found"), { statusCode: 404 });
+  }
+  if (restaurantId && String(job.restaurantId) !== String(restaurantId)) {
+    throw Object.assign(new Error("Forbidden"), { statusCode: 403 });
+  }
+  assertPrintJobActive(job);
+  if (job.status === "PRINTED") {
+    throw Object.assign(
+      new Error("Cannot retry a printed job. Use 'Print Again' to create a new print job."),
+      { statusCode: 400 }
+    );
+  }
+
+  let floorId = null;
+  const order = await Order.findById(job.orderId).lean();
+  if (order?.isActive === false) {
+    throw Object.assign(
+      new Error("Cannot retry print for a soft-deleted order"),
+      { statusCode: 400 }
+    );
+  }
+  if (order?.floor) floorId = order.floor;
+
+  const requeuedAt = new Date();
+  await persistStatus(
+    job,
+    {
+      status: "QUEUED",
+      errorMessage: null,
+      startedAt: null,
+      printedAt: null,
+      failedAt: null,
+      metadata: {
+        ...(job.metadata || {}),
+        requeuedAt,
+      },
+    },
+    floorId
+  );
+
+  // Re-resolve only enabled printers — never re-emit a disabled config's
+  // systemPrinterName / connection fields (agents previously printed anyway).
+  let printerConfig = null;
+  if (job.printerId) {
+    printerConfig = await PrinterConfig.findOne({
+      _id: job.printerId,
+      restaurant: job.restaurantId,
+      enabled: true,
+    }).lean();
+  }
+  if (!printerConfig) {
+    printerConfig = await resolvePrinterConfig(
+      job.restaurantId,
+      job.printerTarget,
+    );
+  }
+  if (printerConfig && String(job.printerId || "") !== String(printerConfig._id)) {
+    job.printerId = printerConfig._id;
+    await job.save();
+  }
+  if (!printerConfig) {
+    logger.info(
+      `PrintJob retry ${jobId}: no enabled printer — requeued without printer payload`,
+    );
+  }
+  emitPrintEvent(
+    "NEW_PRINT_JOB",
+    job.restaurantId,
+    floorId || null,
+    toPrintJobEventPayload(job, job.metadata?.orderNumber, printerConfig),
+  );
+
+  if (runNow) {
+    return executePrintJob(jobId, { simulateFailure, restaurantId });
+  }
+
+  return { job, result: { success: true, message: "Requeued" } };
+}
+
+/**
+ * Cancel all QUEUED jobs bound to a printer (e.g. when it is disabled).
+ * Returns the number of jobs cancelled.
+ */
+export async function cancelQueuedJobsForPrinter(
+  printerId,
+  { restaurantId } = {},
+) {
+  if (!printerId) return 0;
+  const filter = {
+    printerId,
+    status: "QUEUED",
+    isActive: { $ne: false },
+  };
+  if (restaurantId) {
+    filter.restaurantId = restaurantId;
+  }
+  const jobs = await PrintJob.find(filter);
+  let cancelled = 0;
+  for (const job of jobs) {
+    let floorId = null;
+    try {
+      const order = await Order.findById(job.orderId).select("floor").lean();
+      if (order?.floor) floorId = order.floor;
+    } catch {
+      // best-effort floor for socket emit
+    }
+    await persistStatus(
+      job,
+      {
+        status: "CANCELLED",
+        errorMessage: "Printer disabled",
+        failedAt: new Date(),
+      },
+      floorId,
+    );
+    cancelled += 1;
+  }
+  if (cancelled > 0) {
+    logger.info(
+      `Cancelled ${cancelled} queued print job(s) for disabled printer ${printerId}`,
+    );
+  }
+  return cancelled;
+}
+
+/**
+ * Cancel a QUEUED print job so agents will not print it.
+ */
+export async function cancelPrintJob(jobId, { restaurantId } = {}) {
+  const job = await PrintJob.findById(jobId);
+  if (!job) {
+    throw Object.assign(new Error("Print job not found"), { statusCode: 404 });
+  }
+  if (restaurantId && String(job.restaurantId) !== String(restaurantId)) {
+    throw Object.assign(new Error("Forbidden"), { statusCode: 403 });
+  }
+  assertPrintJobActive(job);
+  if (job.status !== "QUEUED") {
+    throw Object.assign(
+      new Error("Only queued print jobs can be cancelled"),
+      { statusCode: 400 }
+    );
+  }
+
+  let floorId = null;
+  const order = await Order.findById(job.orderId).lean();
+  if (order?.floor) floorId = order.floor;
+
+  await persistStatus(job, { status: "CANCELLED" }, floorId);
+  return job;
+}
+
+export async function markPrintJobPrinted(jobId, { restaurantId } = {}) {
+  const job = await PrintJob.findById(jobId);
+  if (!job) {
+    throw Object.assign(new Error("Print job not found"), { statusCode: 404 });
+  }
+  if (restaurantId && String(job.restaurantId) !== String(restaurantId)) {
+    throw Object.assign(new Error("Forbidden"), { statusCode: 403 });
+  }
+  assertPrintJobActive(job);
+
+  let floorId = null;
+  const order = await Order.findById(job.orderId).lean();
+  if (order?.isActive === false) {
+    throw Object.assign(
+      new Error("Cannot complete print for a soft-deleted order"),
+      { statusCode: 400 }
+    );
+  }
+  if (order?.floor) floorId = order.floor;
+
+  await persistStatus(
+    job,
+    {
+      status: "PRINTED",
+      printedAt: new Date(),
+      errorMessage: null,
+      attemptCount: Math.max(job.attemptCount || 0, 1),
+    },
+    floorId
+  );
+
+  return job;
+}
+
+/**
+ * Create a brand new PrintJob from an existing PrintJob, leaving the original unchanged.
+ */
+export async function reprintPrintJob(
+  jobId,
+  { requestedBy, restaurantId, idempotencyKey } = {}
+) {
+  const original = await PrintJob.findById(jobId);
+  if (!original) {
+    throw Object.assign(new Error("Print job not found"), { statusCode: 404 });
+  }
+  if (restaurantId && String(original.restaurantId) !== String(restaurantId)) {
+    throw Object.assign(new Error("Forbidden"), { statusCode: 403 });
+  }
+  assertPrintJobActive(original);
+
+  // Idempotency check if caller passed an idempotencyKey
+  if (idempotencyKey) {
+    const existing = await PrintJob.findOne({
+      restaurantId: original.restaurantId,
+      idempotencyKey,
+      isActive: { $ne: false },
+    });
+    if (existing) {
+      return { job: existing, created: false };
+    }
+  }
+
+  const order = await Order.findById(original.orderId).lean();
+  if (order?.isActive === false) {
+    throw Object.assign(
+      new Error("Cannot reprint a soft-deleted order"),
+      { statusCode: 400 }
+    );
+  }
+  const floorId = order?.floor || null;
+
+  // Resolve printer configuration: prefer original printer if still enabled, else resolve for target
+  let printerConfig = null;
+  if (original.printerId) {
+    printerConfig = await PrinterConfig.findOne({
+      _id: original.printerId,
+      restaurant: original.restaurantId,
+      enabled: true,
+    }).lean();
+  }
+  if (!printerConfig && original.printerTarget) {
+    printerConfig = await resolvePrinterConfig(
+      original.restaurantId,
+      original.printerTarget
+    );
+  }
+
+  const orderNumber =
+    original.metadata?.orderNumber || order?.orderNumber || null;
+
+  try {
+    const newJob = await PrintJob.create({
+      restaurantId: original.restaurantId,
+      orderId: original.orderId,
+      printType: original.printType,
+      printerTarget: original.printerTarget,
+      // Never keep a disabled original.printerId on the reprint
+      printerId: printerConfig?._id || null,
+      status: "QUEUED",
+      attemptCount: 0,
+      requestedBy: requestedBy || null,
+      parentPrintJobId: original._id,
+      metadata: {
+        ...(original.metadata || {}),
+        orderNumber,
+        isReprint: true,
+        parentPrintJobId: String(original._id),
+        paymentMethod: original.metadata?.paymentMethod || order?.paymentMethod || null,
+        cashAmount: original.metadata?.cashAmount ?? order?.cashAmount ?? null,
+        cardAmount: original.metadata?.cardAmount ?? order?.cardAmount ?? null,
+        giftcardUsedAmount: original.metadata?.giftcardUsedAmount ?? order?.giftcardUsedAmount ?? null,
+        tipAmount: original.metadata?.tipAmount ?? order?.tipAmount ?? null,
+        tipMethod: original.metadata?.tipMethod ?? order?.tipMethod ?? null,
+        serviceChargeTotal: original.metadata?.serviceChargeTotal ?? order?.serviceChargeTotal ?? null,
+        serviceChargeName: original.metadata?.serviceChargeName ?? order?.serviceChargeName ?? null,
+        discountTotal: original.metadata?.discountTotal ?? order?.discountTotal ?? null,
+        discountPercent: original.metadata?.discountPercent ?? order?.discountPercent ?? null,
+        subTotal: original.metadata?.subTotal ?? order?.subTotal ?? null,
+        taxTotal: original.metadata?.taxTotal ?? order?.taxTotal ?? null,
+        totalAmount: original.metadata?.totalAmount ?? order?.totalAmount ?? null,
+      },
+      idempotencyKey: idempotencyKey || undefined,
+    });
+
+    const payload = toPrintJobEventPayload(newJob, orderNumber, printerConfig);
+    emitPrintEvent("NEW_PRINT_JOB", original.restaurantId, floorId, payload);
+
+    logger.info(
+      `Reprint PrintJob created: ${newJob._id} from parent=${original._id} type=${newJob.printType} order=${orderNumber || original.orderId}`
+    );
+
+    return { job: newJob, created: true };
+  } catch (err) {
+    if (err?.code === 11000 && idempotencyKey) {
+      const existing = await PrintJob.findOne({
+        restaurantId: original.restaurantId,
+        idempotencyKey,
+      });
+      if (existing) return { job: existing, created: false };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Reprint a ticket for an order.
+ * If a prior PrintJob exists for this order & printType, it will clone and reprint it.
+ * If none exists, it will construct a new PrintJob marked with isReprint: true.
+ */
+export async function reprintOrderTicket({
+  orderId,
+  printType = "RECEIPT",
+  kotItems = [],
+  guestCount,
+  serverName,
+  specialNote,
+  restaurantName,
+  requestedBy,
+  restaurantId,
+  idempotencyKey,
+}) {
+  const normalizedType = (() => {
+    const s = String(printType || "").toUpperCase();
+    if (s === "CUSTOMER" || s === "RECEIPT") return "RECEIPT";
+    if (s === "BAR" || s === "BAR_RECEIPT") return "BAR_RECEIPT";
+    return "KOT";
+  })();
+
+  // 1. Try to find the latest existing print job for this order and print type
+  const existingJob = await PrintJob.findOne({
+    restaurantId,
+    orderId,
+    printType: normalizedType,
+    isActive: { $ne: false },
+  }).sort({ createdAt: -1 });
+
+  if (existingJob) {
+    return reprintPrintJob(existingJob._id, {
+      requestedBy,
+      restaurantId,
+      idempotencyKey,
+    });
+  }
+
+  // 2. If no prior PrintJob exists, fetch the order document to build a new print job marked as reprint
+  const order = await Order.findOne({
+    _id: orderId,
+    isActive: { $ne: false },
+  }).lean();
+  if (!order) {
+    throw Object.assign(new Error("Order not found"), { statusCode: 404 });
+  }
+
+  const printerTarget =
+    normalizedType === "RECEIPT"
+      ? "RECEIPT"
+      : normalizedType === "BAR_RECEIPT"
+        ? "COUNTER"
+        : "KITCHEN";
+
+  const printerConfig = await resolvePrinterConfig(restaurantId, printerTarget);
+  const floorId = order.floor || null;
+  const orderNumber = order.orderNumber || null;
+
+  const metadata = {
+    orderNumber,
+    isReprint: true,
+    tableNo: order.tableNo || null,
+    guestName: order.guestName || null,
+    partyName: order.partyName || order.guestName || null,
+    floorName: order.floorName || null,
+    serverName: serverName || null,
+    restaurantName: restaurantName || null,
+    guestCount: guestCount ?? order.guestCount ?? null,
+    specialNote: specialNote || order.specialNote || null,
+    paymentMethod: order.paymentMethod || null,
+    cashAmount: order.cashAmount ?? null,
+    cardAmount: order.cardAmount ?? null,
+    giftcardUsedAmount: order.giftcardUsedAmount ?? null,
+    tipAmount: order.tipAmount ?? null,
+    tipMethod: order.tipMethod ?? null,
+    serviceChargeTotal: order.serviceChargeTotal ?? null,
+    serviceChargeName: order.serviceChargeName ?? null,
+    discountTotal: order.discountTotal ?? null,
+    discountPercent: order.discountPercent ?? null,
+    subTotal: order.subTotal ?? null,
+    taxTotal: order.taxTotal ?? null,
+    totalAmount: order.totalAmount ?? null,
+  };
+
+  const rawItems =
+    Array.isArray(kotItems) && kotItems.length > 0 ? kotItems : order.items || [];
+  if (normalizedType === "KOT") {
+    metadata.kotItems = rawItems;
+  } else if (normalizedType === "BAR_RECEIPT") {
+    metadata.barItems = rawItems;
+    metadata.kotItems = rawItems;
+  }
+
+  try {
+    const job = await PrintJob.create({
+      restaurantId,
+      orderId: order._id,
+      printType: normalizedType,
+      printerTarget,
+      printerId: printerConfig?._id || null,
+      status: "QUEUED",
+      attemptCount: 0,
+      requestedBy: requestedBy || null,
+      metadata,
+      idempotencyKey: idempotencyKey || undefined,
+    });
+
+    const payload = toPrintJobEventPayload(job, orderNumber, printerConfig);
+    emitPrintEvent("NEW_PRINT_JOB", restaurantId, floorId, payload);
+
+    logger.info(
+      `Reprint PrintJob created for order: ${job._id} type=${job.printType} order=${orderNumber || order._id}`
+    );
+
+    return { job, created: true };
+  } catch (err) {
+    if (err?.code === 11000 && idempotencyKey) {
+      const existing = await PrintJob.findOne({
+        restaurantId,
+        idempotencyKey,
+      });
+      if (existing) return { job: existing, created: false };
+    }
+    throw err;
+  }
+}
+

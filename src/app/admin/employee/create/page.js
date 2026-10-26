@@ -1,0 +1,617 @@
+"use client";
+
+import React, { useState, useEffect } from "react";
+import Link from "next/link";
+import { ArrowLeft, Loader2, UserPlus, Mail, Phone, User, KeyRound } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { toast } from "sonner";
+import { useRouter } from "next/navigation";
+import { PALETTE } from "@/utils/paletteeColor";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Checkbox } from "@/components/ui/checkbox";
+import { countryCodes } from "@/utils/countryCodes";
+
+export default function CreateServerAccountPage() {
+  const router = useRouter();
+  const [loading, setLoading] = useState(false);
+
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
+  const [email, setEmail] = useState("");
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [countryCode, setCountryCode] = useState("+1");
+  const [role, setRole] = useState("Staff");
+  const [employeeColor, setEmployeeColor] = useState("#4ade80");
+  const [totalWorkingHours, setTotalWorkingHours] = useState("");
+  const [amountPerHour, setAmountPerHour] = useState("");
+  const [overtimeAmountPerHour, setOvertimeAmountPerHour] = useState("");
+  const [tipPercent, setTipPercent] = useState("");
+  const [receiveOwnTips, setReceiveOwnTips] = useState(false);
+  const [allocatedTipPercent, setAllocatedTipPercent] = useState(0);
+  const [staffDiscount, setStaffDiscount] = useState("");
+  const [passcode, setPasscode] = useState("");
+
+  // Default Shift Assignment
+  const [defaultShiftTemplate, setDefaultShiftTemplate] = useState("");
+  const [templates, setTemplates] = useState([]);
+  const [existingAdminTerminal, setExistingAdminTerminal] = useState(null);
+  const [isEditMode, setIsEditMode] = useState(false);
+  const [editId, setEditId] = useState(null);
+
+  const remainingTipPercent = Math.max(0, Number((100 - allocatedTipPercent).toFixed(2)));
+  const totalAmountPerDay = (() => {
+    const hours = Number(totalWorkingHours);
+    const rate = Number(amountPerHour);
+    if (!Number.isFinite(hours) || !Number.isFinite(rate) || totalWorkingHours === "" || amountPerHour === "") {
+      return 0;
+    }
+    return Number((hours * rate).toFixed(2));
+  })();
+
+  useEffect(() => {
+    if (role === "Master Terminal") {
+      setTotalWorkingHours("");
+      setAmountPerHour("");
+      setOvertimeAmountPerHour("");
+      setTipPercent("");
+      setReceiveOwnTips(false);
+      setStaffDiscount("");
+    }
+  }, [role]);
+
+  useEffect(() => {
+    // Check if we are in edit mode
+    const searchParams = new URLSearchParams(window.location.search);
+    const id = searchParams.get("id");
+    if (id) {
+      setIsEditMode(true);
+      setEditId(id);
+    }
+
+    // Fetch available roles and templates
+    const fetchInitialData = async () => {
+      try {
+        const [templatesRes, employeesRes] = await Promise.all([
+          fetch("/api/employees/shifts?action=templates", { cache: "no-store" }),
+          fetch("/api/employees", { cache: "no-store" }),
+        ]);
+
+        const templatesJson = await templatesRes.json();
+        if (templatesJson.success) {
+          setTemplates(templatesJson.data);
+        }
+
+        const employeesJson = await employeesRes.json();
+        if (employeesJson.success) {
+          const used = (employeesJson.data || []).reduce((sum, emp) => {
+            if (id && String(emp._id) === String(id)) return sum;
+            if (emp.receiveOwnTips) return sum;
+            return sum + (Number(emp.tipPercent) || 0);
+          }, 0);
+          setAllocatedTipPercent(used);
+          
+          const adminEmp = (employeesJson.data || []).find(emp => 
+            (emp.role === "Master Terminal" || emp.role === "Manager Terminal") && 
+            (!id || String(emp._id) !== String(id))
+          );
+          if (adminEmp) {
+            setExistingAdminTerminal(adminEmp.role);
+          }
+        }
+
+        if (id) {
+          const empRes = await fetch(`/api/employees?id=${id}`);
+          const empJson = await empRes.json();
+          if (empJson.success && empJson.data.length > 0) {
+            const emp = empJson.data[0];
+            setFirstName(emp.firstName || "");
+            setLastName(emp.lastName || "");
+            setEmail(emp.email || "");
+            if (emp.countryCode) setCountryCode(emp.countryCode);
+            setPhoneNumber(emp.phoneNumber || "");
+            if (emp.role) setRole(emp.role);
+            if (emp.employeeColor) setEmployeeColor(emp.employeeColor);
+            if (emp.defaultShiftTemplate) {
+              setDefaultShiftTemplate(
+                typeof emp.defaultShiftTemplate === "object"
+                  ? emp.defaultShiftTemplate._id || String(emp.defaultShiftTemplate)
+                  : String(emp.defaultShiftTemplate)
+              );
+            }
+            if (emp.hourlyPaid?.totalWorkingHours) setTotalWorkingHours(emp.hourlyPaid.totalWorkingHours);
+            if (emp.hourlyPaid?.amountPerHour != null) setAmountPerHour(emp.hourlyPaid.amountPerHour.toString());
+            if (emp.hourlyPaid?.overtimeAmountPerHour != null) {
+              setOvertimeAmountPerHour(emp.hourlyPaid.overtimeAmountPerHour.toString());
+            }
+            if (emp.receiveOwnTips) {
+              setReceiveOwnTips(true);
+              setTipPercent("");
+            } else {
+              setReceiveOwnTips(false);
+              if (emp.tipPercent != null) setTipPercent(emp.tipPercent.toString());
+            }
+            if (emp.staffDiscount !== undefined) setStaffDiscount(emp.staffDiscount.toString());
+            try {
+              const credRes = await fetch(`/api/employees/credentials?id=${id}`);
+              const credJson = await credRes.json();
+              if (credJson.success && credJson.data?.passcode) {
+                setPasscode(credJson.data.passcode);
+              }
+            } catch (err) {}
+          }
+        }
+      } catch (err) {
+        toast.error("Failed to fetch data");
+      }
+    };
+    fetchInitialData();
+  }, []);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!firstName.trim() || !lastName.trim() || !email.trim() || !phoneNumber.trim()) {
+      toast.error("First Name, Last Name, Email, and Phone Number are required.");
+      return;
+    }
+    if (!isEditMode && !passcode.trim()) {
+      toast.error("Passcode is required.");
+      return;
+    }
+
+    if (receiveOwnTips && tipPercent !== "") {
+      toast.error("Choose either tip percent or keep earned tips, not both.");
+      return;
+    }
+
+    if (!receiveOwnTips && tipPercent !== "") {
+      const tipValue = Number(tipPercent);
+      if (!Number.isFinite(tipValue) || tipValue < 0) {
+        toast.error("Tip percent must be a valid number.");
+        return;
+      }
+      if (tipValue > remainingTipPercent) {
+        toast.error(`Tip percent cannot exceed available ${remainingTipPercent}%.`);
+        return;
+      }
+    }
+
+    setLoading(true);
+    try {
+      const payload = {
+        firstName: firstName.trim(),
+        lastName: lastName.trim(),
+        countryCode,
+        phoneNumber: phoneNumber.trim(),
+        role: role,
+        employeeColor: employeeColor,
+        defaultShiftTemplate: defaultShiftTemplate && defaultShiftTemplate !== "none" ? defaultShiftTemplate : null,
+        hourlyPaid: (totalWorkingHours || amountPerHour || overtimeAmountPerHour) ? {
+          totalWorkingHours: totalWorkingHours.trim(),
+          amountPerHour: amountPerHour !== "" ? Number(amountPerHour) : null,
+          totalAmountPerDay,
+          overtimeAmountPerHour: overtimeAmountPerHour !== "" ? Number(overtimeAmountPerHour) : null,
+        } : undefined,
+        tipPercent: receiveOwnTips ? null : tipPercent !== "" ? Number(tipPercent) : null,
+        receiveOwnTips: Boolean(receiveOwnTips),
+        staffDiscount: staffDiscount ? Number(staffDiscount) : undefined
+      };
+
+      if (isEditMode) {
+        if (passcode.trim()) payload.passcode = passcode.trim();
+      } else {
+        payload.passcode = passcode.trim();
+      }
+
+      if (!isEditMode) {
+        payload.email = email.trim();
+      } else {
+        payload._id = editId;
+        payload.action = "updateEmployee";
+      }
+
+      const res = await fetch("/api/employees", {
+        method: isEditMode ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const json = await res.json();
+      if (!res.ok || !json.success) {
+        throw new Error(json.message || (isEditMode ? "Failed to update account" : "Failed to create account"));
+      }
+
+      toast.success(isEditMode ? "Employee updated successfully!" : "Employee account created successfully!");
+      setFirstName("");
+      setLastName("");
+      setEmail("");
+      setPhoneNumber("");
+      setRole("Staff");
+      setEmployeeColor("#4ade80");
+      setTotalWorkingHours("");
+      setAmountPerHour("");
+      setOvertimeAmountPerHour("");
+      setTipPercent("");
+      setReceiveOwnTips(false);
+      setStaffDiscount("");
+      setPasscode("");
+      setDefaultShiftTemplate("");
+
+      // Redirect to list page
+      setTimeout(() => {
+        router.push("/admin/employee");
+      }, 2000);
+    } catch (err) {
+      toast.error(err.message || "Something went wrong.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+
+
+  return (
+    <div className="flex flex-col overflow-hidden min-h-screen" style={{ backgroundColor: PALETTE.canvas, color: PALETTE.ink }}>
+
+      <div className="flex-1 overflow-y-auto p-4">
+        <div className="max-w-200 mx-auto space-y-8 font-sans">
+
+          {/* Header */}
+          <div className="flex flex-col sm:flex-row justify-between sm:items-end gap-4 border-b border-zinc-200 pb-5">
+            <div>
+              <h1 className="text-[32px] font-bold leading-tight" style={{ color: PALETTE.ink }}>
+                {isEditMode ? "Edit Employee" : "Create Employee"}
+              </h1>
+              <p className="text-[15px] mt-1" style={{ color: PALETTE.inkMuted }}>
+                {isEditMode ? "Update staff member details and assignments." : "Add new staff members and assign their roles."}
+              </p>
+            </div>
+            <Button variant="outline" asChild className="h-10 px-4 font-semibold text-[15px] gap-2 hover:bg-zinc-50 border-zinc-200 text-zinc-700">
+              <Link href="/admin/employee">
+                <ArrowLeft className="w-5 h-5" />
+                Back To List
+              </Link>
+            </Button>
+          </div>
+
+          <Card className="shadow-sm border-zinc-200 bg-white overflow-hidden">
+            <CardHeader className="bg-zinc-50/50 border-b border-zinc-100 pb-4">
+              <CardTitle className="text-[18px] font-bold text-zinc-900 flex items-center gap-2">
+                <UserPlus className="w-5 h-5 text-[#1e40af]" /> Employee Information
+              </CardTitle>
+              <CardDescription className="text-[14px]">Enter details for the new staff member.</CardDescription>
+            </CardHeader>
+            <CardContent className="p-6 md:p-8">
+              <form onSubmit={handleSubmit} className="space-y-6">
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="space-y-2">
+                    <label className="text-[14px] font-semibold text-zinc-900">
+                      First Name <span className="text-red-500">*</span>
+                    </label>
+                    <div className="relative">
+                      <User className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-400" />
+                      <Input
+                        type="text"
+                        placeholder="e.g. John"
+                        required
+                        value={firstName}
+                        onChange={(e) => setFirstName(e.target.value)}
+                        className="pl-10 h-12 text-[15px] bg-white border-zinc-200 focus:ring-[#1e40af]"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[14px] font-semibold text-zinc-900">
+                      Last Name <span className="text-red-500">*</span>
+                    </label>
+                    <div className="relative">
+                      <User className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-400" />
+                      <Input
+                        type="text"
+                        placeholder="e.g. Doe"
+                        required
+                        value={lastName}
+                        onChange={(e) => setLastName(e.target.value)}
+                        className="pl-10 h-12 text-[15px] bg-white border-zinc-200 focus:ring-[#1e40af]"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="space-y-2">
+                    <label className="text-[14px] font-semibold text-zinc-900">
+                      Email Address <span className="text-red-500">*</span>
+                    </label>
+                    <div className="relative">
+                      <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-400" />
+                      <Input
+                        type="email"
+                        placeholder="e.g. john.doe@example.com"
+                        required={!isEditMode}
+                        disabled={isEditMode}
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        className="pl-10 h-12 text-[15px] bg-white border-zinc-200 focus:ring-[#1e40af]"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[14px] font-semibold text-zinc-900">
+                      Contact Number <span className="text-red-500">*</span>
+                    </label>
+                    <div className="flex relative">
+                      <Select value={countryCode} onValueChange={setCountryCode}>
+                        <SelectTrigger className="w-32 text-xs h-12 rounded-r-none border-r-0 border-zinc-200 focus:ring-0 focus:border-zinc-200 bg-zinc-50 font-medium">
+                          <SelectValue placeholder="+1" />
+                        </SelectTrigger>
+                        <SelectContent className="bg-white max-h-60 overflow-y-auto">
+                          {countryCodes.map(c => (
+                            <SelectItem key={c.code} value={c.code}>
+                              {c.code} {c.country}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <Input
+                        type="tel"
+                        placeholder="e.g. 555-0199"
+                        required
+                        value={phoneNumber}
+                        onChange={(e) => setPhoneNumber(e.target.value)}
+                        className="h-12 text-[15px] bg-white rounded-l-none border-zinc-200 focus:ring-[#1e40af] flex-1"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[14px] font-semibold text-zinc-900">
+                    Passcode {!isEditMode && <span className="text-red-500">*</span>}
+                  </label>
+                  <div className="relative">
+                    <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-400" />
+                    <Input
+                      type="text"
+                      placeholder="e.g. 4821"
+                      required={!isEditMode}
+                      value={passcode}
+                      onChange={(e) => setPasscode(e.target.value)}
+                      className="pl-10 h-12 text-[15px] bg-white border-zinc-200 focus:ring-[#1e40af]"
+                    />
+                  </div>
+                  <p className="text-xs text-zinc-500">
+                    Saved as entered. Staff can use this on a registered POS device instead of Employee ID and password.
+                    {isEditMode ? " Leave blank to keep the current passcode." : ""}
+                  </p>
+                </div>
+
+                <div className=" flex items-center w-full gap-5">
+                  <div className="w-full">
+                    <label className="text-[14px] font-semibold text-zinc-900 block">
+                      Role <span className="text-red-500">*</span>
+                    </label>
+
+                    <div className="flex gap-2">
+                      <Select value={role} onValueChange={setRole}>
+                        <SelectTrigger className="w-full h-12 text-[15px] border-zinc-200 focus:ring-2 focus:ring-[#1e40af] bg-white">
+                          <SelectValue placeholder="Select role..." />
+                        </SelectTrigger>
+                        <SelectContent className="bg-white max-h-60 overflow-y-auto">
+                          <SelectItem value="Master Terminal" disabled={!!existingAdminTerminal}>Master Terminal</SelectItem>
+                          <SelectItem value="Manager Terminal" disabled={!!existingAdminTerminal}>Manager Terminal</SelectItem>
+                          <SelectItem value="Staff">Staff</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+
+                  <div className="w-full gap-6">
+                    <div className="space-y-2">
+                      <label className="text-[14px] font-semibold text-zinc-900 block">
+                        Employee Color
+                      </label>
+                      <div className="flex gap-2 items-center">
+                        <Input
+                          type="color"
+                          value={employeeColor}
+                          onChange={(e) => setEmployeeColor(e.target.value)}
+                          className="h-12 w-16 p-1 border-zinc-200 cursor-pointer"
+                        />
+                        <span className="text-[14px] text-zinc-600 font-medium font-mono">{employeeColor.toUpperCase()}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="w-full gap-6">
+                  <div className="space-y-2">
+                    <label className="text-[13px] font-medium text-zinc-500 block">
+                      Hourly Paid
+                    </label>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div className="space-y-2">
+                        <label className="text-[14px] font-semibold text-zinc-900 block">
+                          Working Hours
+                        </label>
+                        <Input
+                          type="number"
+                          min="0"
+                          step="any"
+                          placeholder="e.g. 8"
+                          value={totalWorkingHours}
+                          disabled={role === "Master Terminal"}
+                          onChange={(e) => setTotalWorkingHours(e.target.value)}
+                          className="h-12 text-[15px] bg-white border-zinc-200 focus:ring-[#1e40af]"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[14px] font-semibold text-zinc-900 block">
+                          Minimum Hour Paid
+                        </label>
+                        <Input
+                          type="number"
+                          min="0"
+                          step="any"
+                          placeholder="e.g. 10"
+                          value={amountPerHour}
+                          disabled={role === "Master Terminal"}
+                          onChange={(e) => setAmountPerHour(e.target.value)}
+                          className="h-12 text-[15px] bg-white border-zinc-200 focus:ring-[#1e40af]"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[14px] font-semibold text-zinc-900 block">
+                          Total Amount Per Day
+                        </label>
+                        <Input
+                          type="number"
+                          readOnly
+                          value={totalAmountPerDay}
+                          className="h-12 text-[15px] bg-zinc-50 border-zinc-200 focus:ring-[#1e40af]"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="w-full gap-6">
+                  <div className="space-y-2">
+                    <label className="text-[14px] font-semibold text-zinc-900 block">
+                      Overtime Paid Amount
+                    </label>
+                    <Input
+                      type="number"
+                      min="0"
+                      step="any"
+                      placeholder="Overtime rate per hour"
+                      value={overtimeAmountPerHour}
+                      disabled={role === "Master Terminal"}
+                      onChange={(e) => setOvertimeAmountPerHour(e.target.value)}
+                      className="h-12 text-[15px] bg-white border-zinc-200 focus:ring-[#1e40af]"
+                    />
+                  </div>
+                </div>
+
+                <div className="w-full gap-6">
+                  <div className="space-y-3">
+                    <label className="text-[14px] font-semibold text-zinc-900 block">
+                      Tip Amount (%)
+                    </label>
+                    <Input
+                      type="number"
+                      min="0"
+                      max={remainingTipPercent}
+                      step="any"
+                      placeholder={`0 – ${remainingTipPercent}`}
+                      value={tipPercent}
+                      disabled={receiveOwnTips || role === "Master Terminal"}
+                      onChange={(e) => {
+                        setTipPercent(e.target.value);
+                        if (e.target.value !== "") setReceiveOwnTips(false);
+                      }}
+                      className="h-12 text-[15px] bg-white border-zinc-200 focus:ring-[#1e40af] disabled:opacity-60"
+                    />
+                    <p className="text-[13px] text-zinc-500">
+                      Available: {remainingTipPercent}% ({Number(allocatedTipPercent.toFixed(2))}% already allocated)
+                    </p>
+                    <div className="flex items-start gap-3 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-3">
+                      <Checkbox
+                        id="receiveOwnTips"
+                        checked={receiveOwnTips}
+                        disabled={role === "Master Terminal"}
+                        onCheckedChange={(checked) => {
+                          const next = checked === true;
+                          setReceiveOwnTips(next);
+                          if (next) setTipPercent("");
+                        }}
+                        className="mt-0.5 border-zinc-400 data-[state=checked]:bg-[#1e40af] data-[state=checked]:border-[#1e40af]"
+                      />
+                      <label htmlFor="receiveOwnTips" className="cursor-pointer space-y-1">
+                        <span className="block text-[14px] font-semibold text-zinc-900">
+                          Keep all tips earned
+                        </span>
+                        <span className="block text-[13px] text-zinc-500 leading-snug">
+                          Employee receives every tip from tables they served and orders they processed for the day.
+                          Cannot be combined with tip percent.
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="w-full gap-6">
+                  <div className="space-y-2">
+                    <label className="text-[14px] font-semibold text-zinc-900 block">
+                      Staff Discount Offer
+                    </label>
+                    <Input
+                      type="number"
+                      min="0"
+                      placeholder="Enter for percent"
+                      value={staffDiscount}
+                      disabled={role === "Master Terminal"}
+                      onChange={(e) => setStaffDiscount(e.target.value)}
+                      className="h-12 text-[15px] bg-white border-zinc-200 focus:ring-[#1e40af]"
+                    />
+                  </div>
+                </div>
+
+                <div className="w-full gap-6">
+                  <div className="space-y-2">
+                    <label className="text-[14px] font-semibold text-zinc-900 block">
+                      Day Shift
+                    </label>
+                    <Select value={defaultShiftTemplate || "none"} onValueChange={setDefaultShiftTemplate}>
+                      <SelectTrigger className="w-full h-12 text-[15px] border-zinc-200 focus:ring-2 focus:ring-[#1e40af] bg-white">
+                        <SelectValue placeholder="Select shift..." />
+                      </SelectTrigger>
+                      <SelectContent className="bg-white max-h-60 overflow-y-auto">
+                        <SelectItem value="none">None</SelectItem>
+                        {templates.map(t => (
+                          <SelectItem key={String(t._id)} value={String(t._id)}>{t.name}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <div className="pt-6 border-t border-zinc-100 flex justify-end gap-3">
+                  {isEditMode && (
+                    <Button type="button" variant="outline" className="w-full md:w-auto h-12 px-8 text-[15px] font-bold" asChild>
+                      <Link href="/admin/employee">Cancel</Link>
+                    </Button>
+                  )}
+                  <Button
+                    type="submit"
+                    disabled={loading}
+                    className="w-full md:w-auto h-12 px-8 text-[15px] font-bold text-white transition-transform hover:scale-[1.02] shadow-sm flex items-center justify-center gap-2"
+                    style={{ backgroundColor: "#1e40af" }}
+                  >
+                    {loading ? (
+                      <>
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                        <span>{isEditMode ? "Updating..." : "Creating Account..."}</span>
+                      </>
+                    ) : (
+                      <>
+                        <UserPlus className="h-5 w-5" />
+                        <span>{isEditMode ? "Update User Account" : "Create User Account"}</span>
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </form>
+            </CardContent>
+          </Card>
+
+        </div>
+
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,541 @@
+"use client";
+
+import React, { useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import {
+  Search,
+  Plus,
+  MoreHorizontal,
+  ArrowUpDown,
+  ChevronLeft,
+  ChevronRight,
+  Edit,
+  Trash,
+  Loader2,
+  Settings2
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Card, CardContent, CardHeader, CardFooter } from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import { toast } from "sonner";
+import { PALETTE } from "@/utils/paletteeColor";
+import DeleteDialog from "@/components/common/DeleteDialog";
+
+export default function ProductsPage() {
+  const router = useRouter();
+
+  const [products, setProducts] = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [isAddDialogOpen, setIsAddDialogOpen] = useState(false);
+  const [newProductName, setNewProductName] = useState("");
+  const [newProductCodes, setNewProductCodes] = useState("");
+  const [selectedCategory, setSelectedCategory] = useState("");
+  
+  const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
+  const [editingProduct, setEditingProduct] = useState(null);
+  const [editProductName, setEditProductName] = useState("");
+  const [editProductCode, setEditProductCode] = useState("");
+  const [editCategory, setEditCategory] = useState("");
+  
+  const [filterCategory, setFilterCategory] = useState("all");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  const [productToDelete, setProductToDelete] = useState(null);
+
+  const fetchInitialData = async () => {
+    try {
+      const [prodRes, catRes] = await Promise.all([
+        fetch("/api/menu/products"),
+        fetch("/api/menu/categories")
+      ]);
+      const prodJson = await prodRes.json();
+      const catJson = await catRes.json();
+
+      if (prodJson.success) setProducts(prodJson.data);
+      if (catJson.success) setCategories(catJson.data);
+    } catch (e) {
+      toast.error("Failed to fetch data.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  React.useEffect(() => {
+    fetchInitialData();
+  }, []);
+
+  const handleCreateProduct = async (e) => {
+    e.preventDefault();
+    if (!newProductName.trim()) {
+      return toast.error("Please enter a product name.");
+    }
+    if (!selectedCategory) {
+      return toast.error("Please select a category.");
+    }
+
+    try {
+      setIsSubmitting(true);
+      const names = newProductName.split("\n").map(n => n.trim()).filter(n => n.length > 0);
+      const codesRaw = newProductCodes.split("\n").map(c => c.trim());
+      const codes = newProductCodes.trim() === "" ? [] : codesRaw.filter((c, i) => i < names.length || c !== "");
+
+      if (names.length === 0) return toast.error("Please enter at least one valid product name.");
+      if (codes.length > 0 && codes.length !== names.length) {
+         return toast.error("Number of product codes must match the number of product names, or leave it empty.");
+      }
+
+      const res = await fetch("/api/menu/products", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          names: names,
+          codes: codes.length > 0 ? codes : null,
+          categoryId: selectedCategory
+        })
+      });
+      const json = await res.json();
+      if (json.success) {
+        if (json.data.length === 1) {
+          toast.success("Product draft created! Redirecting to configuration...");
+          router.push(`/admin/menu/products/${json.data[0]._id}`);
+        } else {
+          toast.success(`${json.data.length} product drafts created!`);
+          setIsAddDialogOpen(false);
+          setNewProductName("");
+          setNewProductCodes("");
+          fetchInitialData();
+        }
+      } else {
+        toast.error(json.message);
+      }
+    } catch (e) {
+      toast.error("An error occurred");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleOpenEdit = (product) => {
+    setEditingProduct(product);
+    setEditProductName(product.name);
+    setEditProductCode(product.productCode || "");
+    setEditCategory(product.category?._id || product.category || "");
+    setIsEditDialogOpen(true);
+  };
+
+  const handleEditSubmit = async (e) => {
+    e.preventDefault();
+    if (!editProductName.trim()) return toast.error("Product name is required");
+    if (!editCategory) return toast.error("Category is required");
+
+    try {
+      setIsSubmitting(true);
+      const res = await fetch(`/api/menu/products/${editingProduct._id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: editProductName.trim(),
+          productCode: editProductCode.trim(),
+          category: editCategory
+        })
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast.success("Product updated successfully!");
+        setIsEditDialogOpen(false);
+        fetchInitialData();
+      } else {
+        toast.error(json.message);
+      }
+    } catch (error) {
+      toast.error("Failed to update product");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleToggleStatus = async (prod) => {
+    const newStatus = prod.status === "Active" ? "Inactive" : "Active";
+    try {
+      const res = await fetch(`/api/menu/products/${prod._id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: newStatus })
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast.success(`Status updated to ${newStatus}`);
+        setProducts(products.map(p => p._id === prod._id ? { ...p, status: newStatus } : p));
+      } else {
+        toast.error(json.message);
+      }
+    } catch (e) {
+      toast.error("Failed to update status");
+    }
+  };
+
+  const handleDeletePrompt = (id) => {
+    setProductToDelete(id);
+    setIsDeleteDialogOpen(true);
+  };
+
+  const confirmDelete = async () => {
+    if (!productToDelete) return;
+    try {
+      const res = await fetch(`/api/menu/products/${productToDelete}`, { method: "DELETE" });
+      const json = await res.json();
+      if (json.success) {
+        toast.success("Product deleted successfully.");
+        fetchInitialData();
+      } else {
+        toast.error(json.message);
+      }
+    } catch (e) {
+      toast.error("Failed to delete product");
+    } finally {
+      setIsDeleteDialogOpen(false);
+      setProductToDelete(null);
+    }
+  };
+
+  const filteredProducts = products.filter(p => {
+    const term = searchQuery.toLowerCase();
+    const catName = p.category?.name?.toLowerCase() || "";
+    const matchesSearch = p.name.toLowerCase().includes(term) || catName.includes(term);
+    
+    if (filterCategory === "all") return matchesSearch;
+    return matchesSearch && p.category?._id === filterCategory;
+  });
+
+  return (
+    <div className="flex flex-col overflow-hidden" style={{ backgroundColor: PALETTE.canvas, color: PALETTE.ink }}>
+      {/* MAIN CONTENT AREA */}
+      <div className="flex-1 flex overflow-hidden">
+
+        {/* PAGE CONTENT */}
+        <main className="flex-1 overflow-y-auto p-8">
+          <div className="max-w-300 mx-auto space-y-8">
+
+            {/* Page Header */}
+            <div className="flex items-end justify-between">
+              <div>
+                <h1 className="text-[32px] font-bold leading-tight" style={{ color: PALETTE.ink }}>
+                  Menu Products
+                </h1>
+                <p className="text-[15px] mt-1" style={{ color: PALETTE.inkMuted }}>
+                  Manage individual menu items, prices, and assignments to categories.
+                </p>
+              </div>
+
+              <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
+                <DialogTrigger asChild>
+                  <Button className="h-10 px-4 font-semibold text-[15px] gap-2 transition-transform hover:scale-[1.02]" style={{ backgroundColor: PALETTE.accent, color: "white" }}>
+                    <Plus className="w-5 h-5" />
+                    Add Product
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="sm:max-w-106.25">
+                  <form onSubmit={handleCreateProduct}>
+                    <DialogHeader>  
+                      <DialogTitle className="text-[22px] font-bold">Add Product</DialogTitle>
+                      <DialogDescription className="text-[15px]">
+                        Create a new product draft. You can configure prices and modifiers later.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="py-6 space-y-5">
+                      <div className="space-y-2">
+                        <label className="text-[14px] font-semibold" style={{ color: PALETTE.ink }}>
+                          Category <span className="text-red-500">*</span>
+                        </label>
+                        <Select value={selectedCategory} onValueChange={setSelectedCategory}>
+                          <SelectTrigger className="h-11 text-[16px]">
+                            <SelectValue placeholder="Select Category" />
+                          </SelectTrigger>
+                          <SelectContent className="bg-white max-h-60 overflow-y-auto">
+                            {categories.map(c => (
+                              <SelectItem  key={c._id} value={c._id}>{c.name}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-[14px] font-semibold" style={{ color: PALETTE.ink }}>
+                          Product Name(s) <span className="text-red-500">*</span>
+                        </label>
+                        <p className="text-[12px] text-zinc-500 mb-1">Enter one product name per line to create multiple at once.</p>
+                        <textarea
+                          autoFocus
+                          placeholder="Enter one product name per line to create multiple at once"
+                          className="w-full bg-white border border-zinc-200 rounded-md min-h-30 p-3 text-[16px] focus:outline-none focus:ring-2 focus:ring-[#F97316]"
+                          value={newProductName}
+                          onChange={(e) => setNewProductName(e.target.value)}
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-[14px] font-semibold" style={{ color: PALETTE.ink }}>
+                          Product Code(s) <span className="text-zinc-400 font-normal">(Optional)</span>
+                        </label>
+                        <p className="text-[12px] text-zinc-500 mb-1">Enter one product code per line, matching the order of names above.</p>
+                        <textarea
+                          placeholder="Enter one product code per line (optional)"
+                          className="w-full bg-white border border-zinc-200 rounded-md min-h-30 p-3 text-[16px] focus:outline-none focus:ring-2 focus:ring-[#F97316]"
+                          value={newProductCodes}
+                          onChange={(e) => setNewProductCodes(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                    <DialogFooter>
+                      <Button type="button" variant="outline" onClick={() => setIsAddDialogOpen(false)} disabled={isSubmitting} className="h-11 px-6 font-semibold cursor-pointer">
+                        Cancel
+                      </Button>
+                      <Button type="submit" disabled={isSubmitting} className="h-11 px-6 font-semibold cursor-pointer" style={{ backgroundColor: PALETTE.accent, color: "white" }}>
+                        {isSubmitting ? <Loader2 className="w-5 h-5 animate-spin mr-2" /> : null}
+                        {isSubmitting ? "Creating..." : "Create Draft"}
+                      </Button>
+                    </DialogFooter>
+                  </form>
+                </DialogContent>
+              </Dialog>
+
+              <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
+                <DialogContent className="sm:max-w-106.25">
+                  <form onSubmit={handleEditSubmit}>
+                    <DialogHeader>  
+                      <DialogTitle className="text-[22px] font-bold">Edit Product</DialogTitle>
+                      <DialogDescription className="text-[15px]">
+                        Update the basic details of this product.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="py-6 space-y-5">
+                      <div className="space-y-2">
+                        <label className="text-[14px] font-semibold" style={{ color: PALETTE.ink }}>
+                          Category <span className="text-red-500">*</span>
+                        </label>
+                        <Select value={editCategory} onValueChange={setEditCategory}>
+                          <SelectTrigger className="h-11 text-[16px]">
+                            <SelectValue placeholder="Select Category" />
+                          </SelectTrigger>
+                          <SelectContent className="bg-white max-h-60 overflow-y-auto">
+                            {categories.map(c => (
+                              <SelectItem key={c._id} value={c._id}>{c.name}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-[14px] font-semibold" style={{ color: PALETTE.ink }}>
+                          Product Name <span className="text-red-500">*</span>
+                        </label>
+                        <Input
+                          autoFocus
+                          placeholder="Product Name"
+                          className="w-full bg-white border border-zinc-200 rounded-md h-11 px-3 text-[16px] focus:outline-none focus:ring-2 focus:ring-[#F97316]"
+                          value={editProductName}
+                          onChange={(e) => setEditProductName(e.target.value)}
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-[14px] font-semibold" style={{ color: PALETTE.ink }}>
+                          Product Code <span className="text-zinc-400 font-normal">(Optional)</span>
+                        </label>
+                        <Input
+                          placeholder="Product Code"
+                          className="w-full bg-white border border-zinc-200 rounded-md h-11 px-3 text-[16px] focus:outline-none focus:ring-2 focus:ring-[#F97316]"
+                          value={editProductCode}
+                          onChange={(e) => setEditProductCode(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                    <DialogFooter>
+                      <Button type="button" variant="outline" onClick={() => setIsEditDialogOpen(false)} disabled={isSubmitting} className="h-11 px-6 font-semibold cursor-pointer">
+                        Cancel
+                      </Button>
+                      <Button type="submit" disabled={isSubmitting} className="h-11 px-6 font-semibold cursor-pointer" style={{ backgroundColor: PALETTE.accent, color: "white" }}>
+                        {isSubmitting ? <Loader2 className="w-5 h-5 animate-spin mr-2" /> : null}
+                        {isSubmitting ? "Saving..." : "Save Changes"}
+                      </Button>
+                    </DialogFooter>
+                  </form>
+                </DialogContent>
+              </Dialog>
+            </div>
+
+            {/* Table Card */}
+            <Card className="bg-white border-0 rounded-xl overflow-hidden" style={{ boxShadow: "0 1px 3px rgba(0,0,0,0.06)", border: `1px solid ${PALETTE.border}` }}>
+
+              {/* Toolbar */}
+              <CardHeader className="px-6 py-5 border-b" style={{ borderColor: PALETTE.border, paddingBottom: "1.25rem" }}>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="flex flex-col sm:flex-row gap-3 w-full sm:w-auto">
+                    <div className="relative w-full sm:w-80">
+                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400" />
+                      <Input
+                        placeholder="Search products..."
+                        className="h-10 pl-9 bg-zinc-50 border-zinc-200 text-[14px]"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                      />
+                    </div>
+                    <Select value={filterCategory} onValueChange={setFilterCategory}>
+                      <SelectTrigger className="h-10 w-full sm:w-48 bg-white border-zinc-200 text-[14px]">
+                        <SelectValue placeholder="All Categories" />
+                      </SelectTrigger>
+                      <SelectContent className="max-h-60 overflow-y-auto">
+                        <SelectItem value="all">All Categories</SelectItem>
+                        {categories.map(c => (
+                          <SelectItem className="" key={c._id} value={c._id}>{c.name}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              </CardHeader>
+
+              {/* Table */}
+              <CardContent className="p-0">
+                <Table>
+                  <TableHeader className="bg-zinc-50 sticky top-0 z-10 border-b border-zinc-200">
+                    <TableRow className="hover:bg-transparent">
+                      <TableHead className="w-[50%] text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6">
+                        Product / Category <ArrowUpDown className="inline w-3 h-3 ml-1" />
+                      </TableHead>
+                      <TableHead className="text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6">
+                        Status
+                      </TableHead>
+                      <TableHead className="text-right text-[12px] font-bold uppercase tracking-wider text-zinc-500 py-4 px-6">
+                        Actions
+                      </TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {loading ? (
+                      Array.from({ length: 4 }).map((_, index) => (
+                        <TableRow key={index} className="h-20 border-b border-zinc-100">
+                          <TableCell className="px-6">
+                            <div className="flex items-center gap-4">
+                              <div className="h-12 w-12 bg-zinc-200 rounded-lg animate-pulse shrink-0" />
+                              <div className="space-y-2">
+                                <div className="h-4 w-40 bg-zinc-200 rounded animate-pulse" />
+                                <div className="h-3 w-24 bg-zinc-200 rounded animate-pulse" />
+                              </div>
+                            </div>
+                          </TableCell>
+                          <TableCell className="px-6">
+                            <div className="h-6 w-16 bg-zinc-200 rounded-full animate-pulse" />
+                          </TableCell>
+                          <TableCell className="px-6 text-right">
+                            <div className="flex justify-end">
+                              <div className="h-8 w-8 bg-zinc-200 rounded animate-pulse" />
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    ) : filteredProducts.length > 0 ? (
+                      filteredProducts.map((p) => (
+                        <TableRow key={p._id} className="h-16 hover:bg-zinc-50 transition-colors">
+                          <TableCell className="px-6 py-3">
+                            <div className="flex flex-col">
+                              <span className="text-[15px] font-semibold text-zinc-900 leading-tight">
+                                {p.name}
+                              </span>
+                              <span className="text-[13px] text-zinc-500 mt-1">
+                                {p.category?.name || "Uncategorized"} 
+                                {p.productCode ? ` • ${p.productCode}` : ""}
+                              </span>
+                            </div>
+                          </TableCell>
+                          <TableCell className="px-6">
+                            <Button variant="ghost" className="p-0 h-auto hover:bg-transparent" onClick={() => handleToggleStatus(p)}>
+                              {p.status === "Active" ? (
+                                <Badge className="bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 px-2.5 py-1 text-[13px] font-semibold transition-colors cursor-pointer">
+                                  Active
+                                </Badge>
+                              ) : (
+                                <Badge className="bg-zinc-100 text-zinc-600 hover:bg-zinc-200 border border-zinc-200 px-2.5 py-1 text-[13px] font-semibold transition-colors cursor-pointer">
+                                  Inactive
+                                </Badge>
+                              )}
+                            </Button>
+                          </TableCell>
+                          <TableCell className="px-6 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              <Button variant="outline" size="sm" className="h-8 text-[12px] font-semibold" asChild>
+                                <Link href={`/admin/menu/products/${p._id}`}>Edit Product</Link>
+                              </Button>
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button variant="ghost" size="icon" className="h-8 w-8 border text-zinc-500 hover:text-zinc-900 cursor-pointer">
+                                    <MoreHorizontal className="h-4 w-4" />
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="w-40 bg-white">
+                                  <DropdownMenuItem className="text-[14px] font-medium cursor-pointer" onClick={() => { setTimeout(() => handleOpenEdit(p), 150) }}>
+                                    <Edit className="mr-2 h-4 w-4" /> Edit Details
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    className="text-[14px] font-medium text-red-600 focus:bg-red-500 focus:text-white cursor-pointer"
+                                    onClick={() => { setTimeout(() => handleDeletePrompt(p._id), 150) }}
+                                  >
+                                    <Trash className="mr-2 h-4 w-4" /> Delete
+                                  </DropdownMenuItem>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    ) : (
+                      <TableRow>
+                        <TableCell colSpan={3} className="h-32 text-center text-zinc-500 text-[15px]">
+                          No products found matching &quot;{searchQuery}&quot;
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </CardContent>
+
+              {/* Pagination */}
+              <CardFooter className="px-6 py-4 border-t border-zinc-200 bg-zinc-50 flex items-center justify-between">
+                <span className="text-[14px] text-zinc-500 font-medium">
+                  Showing {filteredProducts.length} of {products.length} products
+                </span>
+                <div className="flex items-center gap-1">
+                  <Button variant="outline" size="icon" className="h-8 w-8 text-zinc-400" disabled>
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <Button variant="outline" size="icon" className="h-8 w-8 text-zinc-400" disabled>
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </CardFooter>
+            </Card>
+
+          </div>
+        </main>
+      </div>
+
+      <DeleteDialog
+        isOpen={isDeleteDialogOpen}
+        onOpenChange={setIsDeleteDialogOpen}
+        onConfirm={confirmDelete}
+        title="Delete Product"
+        description="Are you sure you want to delete this product? This action cannot be undone."
+      />
+    </div>
+  );
+}

@@ -1,0 +1,176 @@
+@import "tailwindcss";
+
+:root {
+  --background: #fbf9f5;
+  --foreground: #1b1c1a;
+  --primary: #e06d26;
+  --primary-hover: #c45a1a;
+  --accent: #e06d26;
+  --accent-hover: #c45a1a;
+  --border: #c6c6cd;
+  --muted: #45464d;
+  --ink: #0f172a;
+  --customer-surface: #fbf9f5;
+  --customer-surface-low: #f5f3ef;
+  --customer-surface-container: #efeeea;
+  --customer-ink: #1b1c1a;
+  --customer-muted: #45464d;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-border: var(--border);
+  --font-serif: var(--font-display), var(--font-body), "Segoe UI", sans-serif;
+  --font-sans: var(--font-body), "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --animate-accordion-down: accordion-down 0.2s ease-out;
+  --animate-accordion-up: accordion-up 0.2s ease-out;
+}
+
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
+}
+
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-body), "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Landing / in-page section navigation */
+html.smooth-scroll {
+  scroll-behavior: smooth;
+  scroll-padding-top: 5.5rem; /* fixed navbar (h-20) + breathing room */
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.smooth-scroll {
+    scroll-behavior: auto;
+  }
+}
+
+/* Tabular numerals for prices, totals, quantities */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Orange scrollbar — every page and overflow container */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary) #f4f4f5;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #f4f4f5;
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--primary);
+  border-radius: 9999px;
+  border: 1px solid #f4f4f5;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--primary-hover);
+}
+
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary) #f4f4f5;
+}
+
+.no-scrollbar,
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.no-scrollbar::-webkit-scrollbar,
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+/* Hide browser-native password reveal (Edge/Chrome on Windows) */
+.no-native-password-reveal::-ms-reveal,
+.no-native-password-reveal::-ms-clear {
+  display: none;
+}
+
+@keyframes sheet-in-right {
+  from { transform: translate3d(100%, 0, 0); }
+  to { transform: translate3d(0, 0, 0); }
+}
+
+@keyframes sheet-out-right {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(100%, 0, 0); }
+}
+
+@keyframes sheet-overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes sheet-overlay-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes sheet-body-in {
+  from {
+    opacity: 0;
+    transform: translate3d(12px, 0, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.sheet-overlay[data-state="open"] {
+  animation: sheet-overlay-in 280ms ease-out both;
+}
+
+.sheet-overlay[data-state="closed"] {
+  animation: sheet-overlay-out 220ms ease-in both;
+}
+
+.sheet-panel-right[data-state="open"] {
+  animation: sheet-in-right 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.sheet-panel-right[data-state="closed"] {
+  animation: sheet-out-right 280ms ease-in both;
+}
+
+.sheet-body-in {
+  animation: sheet-body-in 380ms ease-out both;
+}

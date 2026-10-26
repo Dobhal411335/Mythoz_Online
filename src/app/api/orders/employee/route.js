@@ -1,0 +1,1415 @@
+import { withAuth } from "@/utils/auth";
+import Order from "@/models/Order";
+import Employee from "@/models/employee/Employee";
+import TableSession from "@/models/floor/TableSession";
+import Restaurant from "@/models/Restaurant";
+import { sendSuccess } from "@/utils/apiResponse";
+import { sendError } from "@/utils/errorHandler";
+import { logger } from "@/utils/logger";
+import { getNextOrderNumber, getNextInvoiceNumber } from "@/utils/generateOrderNumber"; 
+import OperationalAuditLog from "@/models/OperationalAuditLog";
+import { resolveOperationalActor } from "@/lib/orders/resolveOperationalActor";
+import { createKotPrintJob, createBarReceiptPrintJob } from "@/lib/printing/printJobService";
+import { createNotification } from "@/lib/notifications/notificationService";
+import { getSocketServer } from "@/lib/socketServer";
+import { sendOnlineOrderStatusEmail } from "@/lib/brevo/sendOnlineOrderStatusEmail";
+import { getPublicRestaurantProfile } from "@/lib/public/resolveRestaurant";
+import Table from "@/models/floor/Table";
+import Floor from "@/models/floor/Floor";
+import { repricePosCartItems } from "@/lib/orders/repricePosCartItems";
+import { formatSessionTableLabel, formatTableLocation, joinTableNumbers } from "@/utils/orderDisplay";
+import { freeSessionTables } from "@/lib/orders/sessionTables";
+import { countryCodes } from "@/utils/countryCodes";
+import {
+  cartChoiceSelectionsKey,
+  cartCustomDataSelectionsKey,
+  cartCustomExtrasKey,
+} from "@/utils/productChoices";
+import {
+  businessDateBounds,
+  todayBusinessDate,
+} from "@/lib/eod/eodHelpers";
+import {
+  todaySalesOrdersOrClause,
+  futureOfferFulfillmentExclusion,
+} from "@/lib/public/offerFulfillment";
+import {
+  normalizeSeatNumber,
+  seatKey,
+  seatNumbersEqual,
+  seatPrintLabel,
+  validateSeatNumbersForGuestCount,
+} from "@/lib/orders/seatHelpers";
+
+function orderItemsMatch(existingItem, incomingItem) {
+  if (existingItem.cartId === incomingItem.cartId) return true;
+  return (
+    existingItem.menuItemId === incomingItem.menuItemId &&
+    JSON.stringify(existingItem.options) === JSON.stringify(incomingItem.options) &&
+    existingItem.size === incomingItem.size &&
+    seatNumbersEqual(existingItem.seatNumber, incomingItem.seatNumber) &&
+    cartCustomExtrasKey(existingItem.customExtras) ===
+      cartCustomExtrasKey(incomingItem.customExtras) &&
+    cartChoiceSelectionsKey(existingItem.choiceSelections) ===
+      cartChoiceSelectionsKey(incomingItem.choiceSelections) &&
+    cartCustomDataSelectionsKey(existingItem.customDataSelections) ===
+      cartCustomDataSelectionsKey(incomingItem.customDataSelections) &&
+    cartChoiceSelectionsKey(existingItem.addonChoiceSelections) ===
+      cartChoiceSelectionsKey(incomingItem.addonChoiceSelections)
+  );
+}
+
+function withSeatPrintFields(item) {
+  const seatNumber = normalizeSeatNumber(item?.seatNumber);
+  const seat = seatPrintLabel(seatNumber, { includeTable: true });
+  return {
+    ...item,
+    seatNumber,
+    ...(seat != null ? { seat } : {}),
+  };
+}
+
+function normalizeProductType(value) {
+  return String(value || "").toUpperCase() === "BAR" ? "BAR" : "KITCHEN";
+}
+
+function cartHasKitchenItem(items = []) {
+  return items.some((item) => normalizeProductType(item.productType) !== "BAR");
+}
+
+function formatPersonName(person) {
+  if (!person) return null;
+  return person.name || [person.firstName, person.lastName].filter(Boolean).join(" ") || null;
+}
+
+function normalizeGuestEmail(value) {
+  const email = String(value || "").trim().toLowerCase();
+  if (!email) return null;
+  return email.slice(0, 120);
+}
+
+function normalizeGuestPhone(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length < 7) return null;
+  return digits.slice(0, 15);
+}
+
+function normalizeGuestCountryCode(value) {
+  const code = String(value || "").trim();
+  if (!code) return null;
+  return countryCodes.some((entry) => entry.code === code) ? code : null;
+}
+
+function resolveGuestContact(data) {
+  const phoneSource =
+    data?.contactNumber !== undefined ? data.contactNumber : data?.guestPhone;
+  const contactNumber = normalizeGuestPhone(phoneSource);
+  const guestCountryCode = contactNumber
+    ? normalizeGuestCountryCode(data?.guestCountryCode) || "+1"
+    : null;
+  return {
+    contactNumber,
+    guestCountryCode,
+    guestEmail: normalizeGuestEmail(data?.guestEmail),
+  };
+}
+
+async function resolveServerName(employeeId) {
+  if (!employeeId) return null;
+  const emp = await Employee.findById(employeeId).select("firstName lastName name").lean();
+  if (!emp) return null;
+  return formatPersonName(emp);
+}
+
+async function enrichOrdersWithProcessedBy(orders) {
+  if (!orders?.length) return orders;
+
+  const ids = [
+    ...new Set(
+      orders
+        .map((o) => o.processedBy)
+        .filter(Boolean)
+        .map((id) => String(id?._id || id))
+    ),
+  ];
+
+  const floorIds = [
+    ...new Set(
+      orders
+        .map((o) => o.floor)
+        .filter(Boolean)
+        .map((id) => String(id?._id || id))
+    ),
+  ];
+
+  const sessionIds = [
+    ...new Set(
+      orders
+        .map((o) => o.tableSession)
+        .filter(Boolean)
+        .map((s) => String(s?._id || s.id || s))
+    ),
+  ];
+
+  const [employees, floors, sessions] = await Promise.all([
+    ids.length
+      ? Employee.find({ _id: { $in: ids } })
+          .select("firstName lastName name role")
+          .lean()
+      : [],
+    floorIds.length
+      ? Floor.find({ _id: { $in: floorIds } }).select("name").lean()
+      : [],
+    sessionIds.length
+      ? TableSession.find({ _id: { $in: sessionIds } })
+          .select("_id status isSessionOpen closedAt")
+          .lean()
+      : [],
+  ]);
+  const empMap = new Map(employees.map((e) => [String(e._id), e]));
+  const floorMap = new Map(floors.map((f) => [String(f._id), f.name]));
+  const sessionMap = new Map(sessions.map((s) => [String(s._id), s]));
+
+  return orders.map((order) => {
+    const rawId = order.processedBy ? String(order.processedBy._id || order.processedBy) : null;
+    const emp = rawId ? empMap.get(rawId) : null;
+    const floorName =
+      order.floor?.name ||
+      floorMap.get(String(order.floor?._id || order.floor)) ||
+      null;
+
+    const rawSessionId = order.tableSession
+      ? String(order.tableSession._id || order.tableSession.id || order.tableSession)
+      : null;
+    const sessionDoc = rawSessionId ? sessionMap.get(rawSessionId) : null;
+    const isSessionOpen = sessionDoc ? Boolean(sessionDoc.isSessionOpen) : false;
+    const sessionStatus = sessionDoc ? sessionDoc.status : null;
+
+    return {
+      ...order,
+      processedByName: formatPersonName(emp),
+      processedByRole: emp?.role || null,
+      floorName,
+      tableNo: formatTableLocation(order.tableNo, floorName),
+      tableSession: sessionDoc
+        ? {
+            ...(typeof order.tableSession === "object" ? order.tableSession : {}),
+            _id: sessionDoc._id,
+            id: sessionDoc._id,
+            status: sessionDoc.status,
+            isSessionOpen,
+          }
+        : order.tableSession,
+      isSessionOpen,
+      sessionStatus,
+    };
+  });
+}
+
+async function notifyOrderEvent({
+  type,
+  order,
+  employeeId,
+  floorId,
+  tableId,
+  tableSessionId,
+  tableNo,
+  serverName,
+}) {
+  const label = tableNo
+    ? (/^tables?\b/i.test(String(tableNo).trim())
+        ? String(tableNo).trim()
+        : `Table ${tableNo}`)
+    : "no table";
+  const titles = {
+    NEW_ORDER: "New Order",
+    ORDER_UPDATED: "Order Updated",
+    KOT_CREATED: "KOT Created",
+  };
+  const messages = {
+    NEW_ORDER: `Order #${order.orderNumber} has been created for ${label}`,
+    ORDER_UPDATED: `Order #${order.orderNumber} was updated for ${label}`,
+    KOT_CREATED: `Kitchen ticket created for Order #${order.orderNumber}`,
+  };
+
+  await createNotification({
+    restaurantId: order.restaurantId,
+    type,
+    title: titles[type] || type,
+    message: messages[type] || `Order #${order.orderNumber}`,
+    orderId: order._id,
+    tableId: tableId || order.table || null,
+    tableSessionId: tableSessionId || order.tableSession || null,
+    employeeId,
+    floorId,
+    metadata: {
+      orderNumber: order.orderNumber,
+      tableNo: tableNo || order.tableNo || null,
+      actorName: serverName || null,
+    },
+  });
+}
+
+async function enqueueOrderTicketPrintJob({
+  order,
+  ticketItems,
+  employeeId,
+  guestCount,
+  routeToKitchen,
+}) {
+  if (!ticketItems?.length) {
+    return {
+      job: null,
+      ticketType: routeToKitchen ? "KOT" : "BAR_RECEIPT",
+      restaurantName: null,
+    };
+  }
+  try {
+    const [serverName, restaurant, floorDoc] = await Promise.all([
+      resolveServerName(order.processedBy || employeeId),
+      Restaurant.findById(order.restaurantId).select("name").lean(),
+      order.floor
+        ? Floor.findById(order.floor).select("name").lean()
+        : Promise.resolve(null),
+    ]);
+    const floorName = order.floorName || floorDoc?.name || null;
+    const common = {
+      order,
+      requestedBy: employeeId,
+      guestCount,
+      serverName,
+      restaurantName: restaurant?.name || null,
+      specialNote: order.specialNote,
+      floorName,
+    };
+
+    if (routeToKitchen) {
+      const { job } = await createKotPrintJob({
+        ...common,
+        kotItems: ticketItems,
+      });
+      return {
+        job,
+        ticketType: "KOT",
+        restaurantName: restaurant?.name || null,
+      };
+    }
+
+    const { job } = await createBarReceiptPrintJob({
+      ...common,
+      barItems: ticketItems,
+    });
+    return {
+      job,
+      ticketType: "BAR_RECEIPT",
+      restaurantName: restaurant?.name || null,
+    };
+  } catch (err) {
+    logger.error("Failed to create ticket PrintJob (order still saved)", err);
+    return { job: null, ticketType: routeToKitchen ? "KOT" : "BAR_RECEIPT", restaurantName: null };
+  }
+}
+
+// POST - Create or Update a POS/Employee order
+export const POST = withAuth(async (request) => {
+  try {
+    const data = await request.json();
+    const { items, specialNote, sessionId, guestName, partyName, guestCount, orderType } = data;
+    const resolvedPartyName = (partyName || guestName || "").trim() || null;
+    const { contactNumber, guestCountryCode, guestEmail } = resolveGuestContact(data);
+    const resolvedGuestCount =
+      guestCount !== undefined && guestCount !== null && guestCount !== ""
+        ? Number(guestCount)
+        : null;
+
+    if (!items || items.length === 0) {
+      return sendError(new Error("Empty cart"), "Cart cannot be empty", 400);
+    }
+
+    const employeeId = request.user.id;
+    const actor = await resolveOperationalActor(request);
+    const actorId = actor.actorId;
+    if (!actorId) {
+      return sendError(
+        new Error("Unauthorized"),
+        "Unable to resolve employee identity for audit logging",
+        401,
+      );
+    }
+    const orderSource = ["WALK_IN", "STAFF", "POS", "ONLINE"].includes(data.source)
+      ? data.source
+      : "POS";
+
+    let staffMember = null;
+    if (orderSource === "STAFF") {
+      const staffForId = data.staffForId;
+      if (!staffForId) {
+        return sendError(new Error("Staff ID missing"), "Please select a staff member", 400);
+      }
+      staffMember = await Employee.findOne({
+        _id: staffForId,
+        restaurant: request.restaurant,
+      });
+      if (!staffMember) {
+        return sendError(new Error("Invalid Staff"), "Selected staff member not found", 404);
+      }
+    }
+
+    let priced;
+    try {
+      priced = await repricePosCartItems({
+        restaurantId: request.restaurant,
+        items,
+        discountCode: orderSource === "STAFF" ? null : (data.discountCode || null),
+        staffDiscountPercent: staffMember?.staffDiscount,
+      });
+    } catch (priceErr) {
+      return sendError(
+        priceErr,
+        priceErr.message || "Failed to price order",
+        priceErr.status || 400,
+      );
+    }
+
+    const {
+      formattedItems,
+      subTotal,
+      taxTotal,
+      serviceChargeTotal,
+      serviceChargeName,
+      discountTotal,
+      discountCode,
+      discountPercent,
+      totalAmount,
+    } = priced;
+
+    const routeToKitchen = cartHasKitchenItem(formattedItems);
+
+    // If no sessionId is provided — direct sale (takeaway, staff, or legacy takeaway)
+    if (!sessionId) {
+      const orderSource = ["WALK_IN", "STAFF", "POS", "ONLINE"].includes(data.source)
+        ? data.source
+        : "POS";
+
+      let directPartyName = resolvedPartyName;
+      let staffFor = staffMember?._id || null;
+      let staffOrderReason = data.staffOrderReason?.trim() || null;
+
+      if (orderSource === "WALK_IN") {
+        directPartyName = (partyName || guestName || "").trim() || "Takeaway";
+      } else if (orderSource === "STAFF") {
+        staffFor = staffMember._id;
+        directPartyName = formatPersonName(staffMember);
+      }
+
+      const orderId = data.orderId;
+
+      // Update existing direct order
+      if (orderId) {
+        const order = await Order.findOne({
+          _id: orderId,
+          restaurantId: request.restaurant,
+          source: orderSource,
+          isActive: { $ne: false },
+          status: { $in: ["PENDING", "CONFIRMED"] },
+        });
+
+        if (!order) {
+          return sendError(new Error("Not Found"), "Active order not found", 404);
+        }
+
+        const kotPayload = [];
+        const finalItems = formattedItems.map((incomingItem) => {
+          const existingItem = order.items.find((i) =>
+            orderItemsMatch(i, incomingItem),
+          );
+          const sentQty = existingItem ? existingItem.sentQty || 0 : 0;
+          const unprintedQty = incomingItem.qty - sentQty;
+
+          if (unprintedQty > 0) {
+            kotPayload.push({ ...incomingItem, qty: unprintedQty });
+          }
+
+          return { ...incomingItem, sentQty: incomingItem.qty };
+        });
+
+        order.items = finalItems;
+        order.subTotal = subTotal;
+        order.taxTotal = taxTotal;
+        order.serviceChargeTotal = serviceChargeTotal;
+        order.serviceChargeName = serviceChargeName || null;
+        order.discountTotal = discountTotal;
+        order.discountCode = discountCode || null;
+        order.discountPercent = discountPercent ?? null;
+        order.totalAmount = totalAmount;
+        order.specialNote = specialNote;
+        order.guestName = directPartyName;
+        order.partyName = directPartyName;
+        order.contactNumber = contactNumber;
+        order.guestCountryCode = guestCountryCode;
+        order.guestEmail = guestEmail;
+        if (orderSource === "STAFF") {
+          order.staffFor = staffFor;
+          order.staffOrderReason = staffOrderReason;
+        }
+        // Keep original processedBy so a later employee cannot take sales/tip credit.
+        if (!order.processedBy) order.processedBy = employeeId;
+        await order.save();
+
+        const { job: printJob, ticketType, restaurantName } = await enqueueOrderTicketPrintJob({
+          order,
+          ticketItems: kotPayload,
+          employeeId,
+          guestCount: Number.isFinite(resolvedGuestCount) ? resolvedGuestCount : null,
+          routeToKitchen,
+        });
+
+        const serverName = await resolveServerName(order.processedBy || employeeId);
+        if (kotPayload.length > 0) {
+          await notifyOrderEvent({
+            type: "ORDER_UPDATED",
+            order,
+            employeeId,
+            serverName,
+          });
+          if (printJob) {
+            await notifyOrderEvent({
+              type: "KOT_CREATED",
+              order,
+              employeeId,
+              serverName,
+            });
+          }
+        }
+
+        logger.info(`Direct ${orderSource} order updated: ${order.orderNumber} by Employee ${employeeId} ticket=${ticketType}`);
+        return sendSuccess(
+          {
+            ...order.toObject(),
+            kotPayload,
+            printJobId: printJob?._id || null,
+            ticketType,
+            processedByName: serverName,
+            restaurantName,
+          },
+          routeToKitchen ? "Order updated successfully" : "Bar ticket updated successfully",
+          200,
+        );
+      }
+
+      // Create new direct order
+      const orderNumber = await getNextOrderNumber(request.restaurant);
+      const invoiceNumber = await getNextInvoiceNumber(request.restaurant);
+      const createPayload = {
+        restaurantId: request.restaurant,
+        orderNumber,
+        originalOrderNumber: orderNumber,
+        isActive: true,
+        invoiceNumber,
+        originalInvoiceNumber: invoiceNumber,
+        items: formattedItems.map((item) => ({ ...item, sentQty: item.qty })),
+        subTotal,
+        taxTotal,
+        serviceChargeTotal,
+        serviceChargeName: serviceChargeName || null,
+        discountTotal,
+        discountCode: discountCode || null,
+        discountPercent: discountPercent ?? null,
+        totalAmount,
+        specialNote: specialNote,
+        guestName: directPartyName,
+        partyName: directPartyName,
+        contactNumber,
+        guestCountryCode,
+        guestEmail,
+        guestCount: Number.isFinite(resolvedGuestCount) ? resolvedGuestCount : null,
+        status: "PENDING",
+        source: orderSource,
+        processedBy: employeeId,
+      };
+
+      if (orderSource === "POS") {
+        createPayload.tableNo = data.tableNo;
+      }
+      if (orderSource === "STAFF") {
+        createPayload.staffFor = staffFor;
+        createPayload.staffOrderReason = staffOrderReason;
+      }
+
+      const newOrder = await Order.create(createPayload);
+
+      const kotPayload = formattedItems;
+      const { job: printJob, ticketType, restaurantName } = await enqueueOrderTicketPrintJob({
+        order: newOrder,
+        ticketItems: kotPayload,
+        employeeId,
+        guestCount: Number.isFinite(resolvedGuestCount) ? resolvedGuestCount : null,
+        routeToKitchen,
+      });
+
+      const serverName = await resolveServerName(employeeId);
+      await notifyOrderEvent({
+        type: "NEW_ORDER",
+        order: newOrder,
+        employeeId,
+        tableNo: orderSource === "POS" ? data.tableNo : null,
+        serverName,
+      });
+      if (printJob && kotPayload.length > 0) {
+        await notifyOrderEvent({
+          type: "KOT_CREATED",
+          order: newOrder,
+          employeeId,
+          tableNo: orderSource === "POS" ? data.tableNo : null,
+          serverName,
+        });
+      }
+
+      logger.info(`Direct ${orderSource} order created: ${orderNumber} by Employee ${employeeId} ticket=${ticketType}`);
+      return sendSuccess(
+        {
+          ...newOrder.toObject(),
+          kotPayload,
+          printJobId: printJob?._id || null,
+          ticketType,
+          processedByName: serverName,
+          restaurantName,
+        },
+        routeToKitchen
+          ? "Order sent to kitchen successfully"
+          : "Bar ticket created successfully",
+        201,
+      );
+    }
+
+    // Session-based Ordering — always scope to authenticated restaurant
+    const session = await TableSession.findOne({
+      _id: sessionId,
+      restaurant: request.restaurant,
+    })
+      .populate("primaryTable")
+      .populate("linkedTables", "tableNumber seats")
+      .populate("floor", "name");
+    if (!session || !session.isSessionOpen) {
+      return sendError(new Error("Invalid Session"), "Table session is invalid or closed", 400);
+    }
+
+    const seatCheck = validateSeatNumbersForGuestCount(
+      formattedItems,
+      session.guestCount,
+    );
+    if (!seatCheck.ok) {
+      return sendError(new Error("Invalid Seat"), seatCheck.message, 400);
+    }
+
+    // Check for existing active order in this session
+    let order = await Order.findOne({
+      tableSession: sessionId,
+      restaurantId: request.restaurant,
+      isActive: { $ne: false },
+      status: { $in: ["PENDING", "CONFIRMED"] }
+    });
+
+    // After a seat/full pay the check may be PAID while the table session is
+    // still open — continue on that same order when more seats order food.
+    if (!order) {
+      order = await Order.findOne({
+        tableSession: sessionId,
+        restaurantId: request.restaurant,
+        isActive: { $ne: false },
+        status: "PAID",
+      }).sort({ createdAt: -1 });
+    }
+
+    if (order) {
+      // Calculate KOT Payload for Continue Order
+      const kotPayload = [];
+      
+      const finalItems = formattedItems.map(incomingItem => {
+        const existingItem = order.items.find((i) => orderItemsMatch(i, incomingItem));
+        const sentQty = existingItem ? (existingItem.sentQty || 0) : 0;
+        const unprintedQty = incomingItem.qty - sentQty;
+        
+        if (unprintedQty > 0) {
+          kotPayload.push(withSeatPrintFields({ ...incomingItem, qty: unprintedQty }));
+        }
+        
+        return { ...incomingItem, sentQty: incomingItem.qty };
+      });
+
+      // Continue Order: Update the existing draft
+      order.items = finalItems;
+      order.subTotal = subTotal;
+      order.taxTotal = taxTotal;
+      order.serviceChargeTotal = serviceChargeTotal;
+      order.serviceChargeName = serviceChargeName || null;
+      order.discountTotal = discountTotal;
+      order.discountCode = discountCode || null;
+      order.discountPercent = discountPercent ?? null;
+      order.totalAmount = totalAmount;
+      order.specialNote = specialNote;
+      // New kitchen tickets reopen a previously paid check so remaining seats can settle.
+      const reopenedAfterPay =
+        order.status === "PAID" ||
+        String(order.paymentStatus || "").toUpperCase() === "PAID";
+      if (reopenedAfterPay) {
+        order.status = "PENDING";
+        order.paymentStatus = "PARTIAL";
+      }
+      // Re-ordering on a released seat: clear release so Pay shows again.
+      if (
+        Array.isArray(order.releasedSeats) &&
+        order.releasedSeats.length > 0 &&
+        kotPayload.length > 0
+      ) {
+        const kotSeatKeys = new Set(
+          kotPayload.map((item) =>
+            seatKey(normalizeSeatNumber(item?.seatNumber)),
+          ),
+        );
+        order.releasedSeats = order.releasedSeats.filter((raw) => {
+          const key =
+            raw === "table" || raw === null || raw === "" || raw === 0
+              ? "table"
+              : seatKey(normalizeSeatNumber(raw));
+          return !kotSeatKeys.has(key);
+        });
+        if (String(order.paymentStatus || "").toUpperCase() === "PAID") {
+          order.status = "PENDING";
+          order.paymentStatus = "PARTIAL";
+        } else if (
+          String(order.paymentStatus || "").toUpperCase() !== "UNPAID" &&
+          String(order.paymentStatus || "").toUpperCase() !== "PENDING"
+        ) {
+          // Keep PARTIAL (or set it) when new items land on a paid/released seat
+          order.paymentStatus = "PARTIAL";
+        }
+      }
+      order.floor = session.floor?._id || session.floor || order.floor;
+      order.tableNo = formatSessionTableLabel(session) || order.tableNo;
+      if (resolvedPartyName !== null || partyName !== undefined || guestName !== undefined) {
+        order.guestName = resolvedPartyName;
+        order.partyName = resolvedPartyName;
+      }
+      if (data.contactNumber !== undefined || data.guestPhone !== undefined) {
+        order.contactNumber = contactNumber;
+        order.guestCountryCode = guestCountryCode;
+      }
+      if (data.guestCountryCode !== undefined && data.contactNumber === undefined && data.guestPhone === undefined) {
+        order.guestCountryCode = guestCountryCode;
+      }
+      if (data.guestEmail !== undefined) {
+        order.guestEmail = guestEmail;
+      }
+      if (guestCount !== undefined) {
+        order.guestCount = Number.isFinite(resolvedGuestCount)
+          ? resolvedGuestCount
+          : (session.guestCount ?? null);
+      } else if (order.guestCount == null && session.guestCount != null) {
+        order.guestCount = session.guestCount;
+      }
+      // Keep original processedBy so a later employee cannot take sales/tip credit.
+      if (!order.processedBy) order.processedBy = employeeId;
+      await order.save();
+
+      if (reopenedAfterPay && session.status === "PAYMENT_PENDING") {
+        session.status = "ACTIVE";
+        await session.save();
+      }
+      
+      if (global.io) global.io.to(`floor:${session.floor}`).emit('order:updated', { orderId: order._id, sessionId });
+
+      // Audit Log
+      await OperationalAuditLog.create({
+        restaurantId: request.restaurant,
+        actorId,
+        actorType: actor.actorType,
+        actorName: actor.actorName,
+        action: 'ORDER_UPDATED',
+        floorId: session.floor,
+        tableId: session.primaryTable._id,
+        tableSessionId: sessionId,
+        orderId: order._id
+      });
+
+      const { job: printJob, ticketType, restaurantName } = await enqueueOrderTicketPrintJob({
+        order,
+        ticketItems: kotPayload,
+        employeeId,
+        guestCount: session.guestCount,
+        routeToKitchen,
+      });
+
+      const serverName = await resolveServerName(order.processedBy || employeeId);
+      const tableNo = formatSessionTableLabel(session);
+      if (kotPayload.length > 0) {
+        await notifyOrderEvent({
+          type: "ORDER_UPDATED",
+          order,
+          employeeId,
+          floorId: session.floor,
+          tableId: session.primaryTable._id,
+          tableSessionId: sessionId,
+          tableNo,
+          serverName,
+        });
+        if (printJob) {
+          await notifyOrderEvent({
+            type: "KOT_CREATED",
+            order,
+            employeeId,
+            floorId: session.floor,
+            tableId: session.primaryTable._id,
+            tableSessionId: sessionId,
+            tableNo,
+            serverName,
+          });
+        }
+      }
+
+      logger.info(`POS Order updated: ${order.orderNumber} for Session ${sessionId} by Employee ${employeeId} ticket=${ticketType}`);
+      return sendSuccess(
+        {
+          ...order.toObject(),
+          kotPayload,
+          printJobId: printJob?._id || null,
+          ticketType,
+          processedByName: serverName,
+          restaurantName,
+        },
+        routeToKitchen
+          ? "Order updated successfully"
+          : "Bar ticket updated successfully",
+        200
+      );
+    } else {
+      // Create New Order
+      const orderNumber = await getNextOrderNumber(request.restaurant);
+      const invoiceNumber = await getNextInvoiceNumber(request.restaurant);
+      const newOrder = await Order.create({
+        restaurantId: request.restaurant,
+        orderNumber,
+        originalOrderNumber: orderNumber,
+        isActive: true,
+        invoiceNumber,
+        originalInvoiceNumber: invoiceNumber,
+        items: formattedItems.map(item => ({ ...item, sentQty: item.qty })),
+        subTotal,
+        taxTotal,
+        serviceChargeTotal,
+        serviceChargeName: serviceChargeName || null,
+        discountTotal,
+        discountCode: discountCode || null,
+        discountPercent: discountPercent ?? null,
+        totalAmount,
+        specialNote: specialNote,
+        
+        // Session links
+        tableSession: sessionId,
+        table: session.primaryTable._id,
+        floor: session.floor?._id || session.floor,
+        tableNo: formatSessionTableLabel(session),
+        guestName: resolvedPartyName,
+        partyName: resolvedPartyName,
+        contactNumber,
+        guestCountryCode,
+        guestEmail,
+        guestCount: Number.isFinite(resolvedGuestCount)
+          ? resolvedGuestCount
+          : (session.guestCount ?? null),
+        
+        status: "PENDING",
+        source: "POS",
+        processedBy: employeeId
+      });
+
+      // Push to session
+      session.activeOrders.push(newOrder._id);
+      await session.save();
+
+      if (global.io) global.io.to(`floor:${session.floor}`).emit('order:created', { orderId: newOrder._id, sessionId });
+
+      // Audit Log
+      await OperationalAuditLog.create({
+        restaurantId: request.restaurant,
+        actorId,
+        actorType: actor.actorType,
+        actorName: actor.actorName,
+        action: 'ORDER_CREATED',
+        floorId: session.floor,
+        tableId: session.primaryTable._id,
+        tableSessionId: sessionId,
+        orderId: newOrder._id
+      });
+
+      const kotPayload = formattedItems.map((item) => withSeatPrintFields(item));
+      const { job: printJob, ticketType, restaurantName } = await enqueueOrderTicketPrintJob({
+        order: newOrder,
+        ticketItems: kotPayload,
+        employeeId,
+        guestCount: session.guestCount,
+        routeToKitchen,
+      });
+
+      const serverName = await resolveServerName(employeeId);
+      const tableNo = formatSessionTableLabel(session);
+      await notifyOrderEvent({
+        type: "NEW_ORDER",
+        order: newOrder,
+        employeeId,
+        floorId: session.floor,
+        tableId: session.primaryTable._id,
+        tableSessionId: sessionId,
+        tableNo,
+        serverName,
+      });
+      if (printJob && kotPayload.length > 0) {
+        await notifyOrderEvent({
+          type: "KOT_CREATED",
+          order: newOrder,
+          employeeId,
+          floorId: session.floor,
+          tableId: session.primaryTable._id,
+          tableSessionId: sessionId,
+          tableNo,
+          serverName,
+        });
+      }
+
+      logger.info(`POS Order created: ${orderNumber} for Session ${sessionId} by Employee ${employeeId} ticket=${ticketType}`);
+      return sendSuccess(
+        {
+          ...newOrder.toObject(),
+          kotPayload,
+          printJobId: printJob?._id || null,
+          ticketType,
+          processedByName: serverName,
+          restaurantName,
+        },
+        routeToKitchen
+          ? "Order sent to kitchen successfully"
+          : "Bar ticket created successfully",
+        201
+      );
+    }
+
+  } catch (error) {
+    logger.error("Failed to process POS order", error);
+    return sendError(error, "Failed to process order", 500);
+  }
+}, ["EMPLOYEE", "MANAGER", "ADMIN", "SERVER", "BARTENDER"]);
+
+// GET - Get orders placed by the current employee or for a specific session
+export const GET = withAuth(async (request) => {
+  try {
+    const { searchParams } = new URL(request.url);
+    const sessionId = searchParams.get("sessionId");
+    const orderId = searchParams.get("orderId");
+    const today = searchParams.get("today");
+    
+    if (orderId) {
+      // Pay / resume any restaurant order by id (POS, takeaway, staff, online).
+      // Do not filter by source — online pickup orders must be payable from Mobile.
+      let order = await Order.findOne({
+        _id: orderId,
+        restaurantId: request.restaurant,
+        isActive: { $ne: false },
+        status: { $nin: ["CANCELLED", "WAIVED"] },
+      }).lean();
+
+      if (!order) {
+        // Still return null for missing/cancelled — client handles paid recovery separately
+        order = null;
+      }
+
+      const [enriched] = order ? await enrichOrdersWithProcessedBy([order]) : [null];
+      return sendSuccess(enriched, "Direct order retrieved");
+    }
+
+    if (sessionId) {
+      // Fetch the active order for this session to load the cart (prefer PENDING/CONFIRMED first)
+      let order = await Order.findOne({
+        tableSession: sessionId,
+        restaurantId: request.restaurant,
+        isActive: { $ne: false },
+        status: { $in: ["PENDING", "CONFIRMED"] }
+      }).sort({ createdAt: -1 }).lean();
+
+      if (!order) {
+        order = await Order.findOne({
+          tableSession: sessionId,
+          restaurantId: request.restaurant,
+          isActive: { $ne: false },
+          status: { $nin: ["CANCELLED", "WAIVED"] }
+        }).sort({ createdAt: -1 }).lean();
+      }
+      
+      const [enriched] = order ? await enrichOrdersWithProcessedBy([order]) : [null];
+      return sendSuccess(enriched, "Session order retrieved");
+    }
+
+    // Unpaid open-order count for employee topnav badge (includes previous day pending orders)
+    if (searchParams.get("unpaidCount") === "true") {
+      const todayStr = todayBusinessDate();
+      const { start, end } = businessDateBounds(todayStr);
+      const unpaidCount = await Order.countDocuments({
+        restaurantId: request.restaurant,
+        isActive: { $ne: false },
+        paymentStatus: { $ne: "PAID" },
+        status: { $nin: ["CANCELLED", "WAIVED", "PAID"] },
+        $or: [
+          todaySalesOrdersOrClause(todayStr, start, end),
+          {
+            createdAt: { $lt: start },
+            ...futureOfferFulfillmentExclusion(todayStr),
+          },
+        ],
+      });
+      return sendSuccess({ unpaidCount }, "Unpaid order count");
+    }
+
+    // Default: Get recent employee orders; today=true returns all restaurant orders for the day + pending prior-day orders
+    const employeeId = request.user.id;
+    const restaurantId = request.restaurant;
+    const startDate = searchParams.get("startDate");
+    const endDate = searchParams.get("endDate");
+    const limitParam = searchParams.get("limit");
+    const limit = limitParam ? Math.min(Math.max(1, Number(limitParam) || 50), 1000) : 500;
+    
+    let query = { restaurantId, isActive: { $ne: false } };
+    let todayStartObj = null;
+
+    if (today === "true") {
+      const todayStr = todayBusinessDate();
+      const { start, end } = businessDateBounds(todayStr);
+      todayStartObj = start;
+      query.$or = [
+        todaySalesOrdersOrClause(todayStr, start, end),
+        {
+          createdAt: { $lt: start },
+          paymentStatus: { $ne: "PAID" },
+          status: { $nin: ["CANCELLED", "WAIVED", "PAID"] },
+          ...futureOfferFulfillmentExclusion(todayStr),
+        },
+      ];
+    } else {
+      query.processedBy = employeeId;
+      if (startDate || endDate) {
+        query.createdAt = {};
+        if (startDate) {
+          const s = new Date(startDate);
+          if (!isNaN(s.getTime())) query.createdAt.$gte = s;
+        }
+        if (endDate) {
+          const e = new Date(endDate);
+          if (!isNaN(e.getTime())) {
+            if (endDate.length === 10) e.setHours(23, 59, 59, 999);
+            query.createdAt.$lte = e;
+          }
+        }
+      }
+    }
+
+    const orders = await Order.find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const enriched = await enrichOrdersWithProcessedBy(orders);
+    const finalOrders = enriched.map((order) => {
+      const createdAtDate = order.createdAt ? new Date(order.createdAt) : null;
+      const isPriorDay =
+        todayStartObj && createdAtDate ? createdAtDate < todayStartObj : false;
+      return {
+        ...order,
+        isPriorDay,
+      };
+    });
+
+    return sendSuccess(finalOrders, "Employee orders retrieved successfully");
+  } catch (error) {
+    logger.error("Failed to fetch employee orders", error);
+    return sendError(error, "Failed to fetch orders", 500);
+  }
+}, ["EMPLOYEE", "MANAGER", "ADMIN", "SERVER", "BARTENDER"]);
+
+// PATCH - Waive unpaid bill OR approve / send KOT for online pickup orders
+export const PATCH = withAuth(async (request) => {
+  try {
+    const employeeId = request.user.id;
+    const restaurantId = request.restaurant;
+    const actor = await resolveOperationalActor(request);
+    const actorId = actor.actorId;
+    if (!actorId) {
+      return sendError(
+        new Error("Unauthorized"),
+        "Unable to resolve employee identity for audit logging",
+        401,
+      );
+    }
+    const body = await request.json();
+    const { orderId, action, reason } = body || {};
+
+    if (!orderId) {
+      return sendError(new Error("Missing orderId"), "orderId is required", 400);
+    }
+
+    if (action === "approve-online") {
+      const order = await Order.findOne({
+        _id: orderId,
+        restaurantId,
+        isActive: { $ne: false },
+      });
+      if (!order) {
+        return sendError(new Error("Not Found"), "Order not found", 404);
+      }
+      if (order.source !== "ONLINE") {
+        return sendError(new Error("Invalid source"), "Only online orders can be approved this way", 400);
+      }
+      if (order.status !== "PENDING") {
+        return sendError(
+          new Error("Invalid Status"),
+          `Order is already ${order.status}. Only pending online orders can be approved.`,
+          400
+        );
+      }
+
+      order.status = "CONFIRMED";
+      order.onlineApprovedAt = new Date();
+      order.onlineApprovedBy = employeeId;
+      if (!order.processedBy) order.processedBy = employeeId;
+      await order.save();
+
+      try {
+        const restaurant = await Restaurant.findById(restaurantId)
+          .select("name address slug")
+          .lean();
+        const profile = restaurant?.slug
+          ? await getPublicRestaurantProfile(restaurant.slug)
+          : null;
+        await sendOnlineOrderStatusEmail({
+          type: "approved",
+          order,
+          restaurantName: profile?.name || restaurant?.name,
+          address: profile?.address || restaurant?.address || null,
+          phone: profile?.phone || null,
+          phoneCode: profile?.phoneCode || null,
+          phoneDisplay: profile?.phoneDisplay || null,
+        });
+      } catch (emailErr) {
+        logger.error("Failed to send online approve email", emailErr);
+      }
+
+      try {
+        await OperationalAuditLog.create({
+          restaurantId,
+          actorId,
+          actorType: actor.actorType,
+          actorName: actor.actorName,
+          action: "ORDER_UPDATED",
+          newValue: {
+            status: "CONFIRMED",
+            orderId: order._id,
+            orderNumber: order.orderNumber,
+            onlineApproved: true,
+          },
+        });
+      } catch (auditErr) {
+        logger.error("Failed to write online-approve audit log", auditErr);
+      }
+
+      try {
+        const io = getSocketServer();
+        io?.to(`restaurant:${restaurantId}`).emit("order:updated", {
+          orderId: order._id,
+          orderNumber: order.orderNumber,
+          source: "ONLINE",
+          status: "CONFIRMED",
+        });
+      } catch (socketErr) {
+        logger.error("Failed to emit online approve socket", socketErr);
+      }
+
+      const [enriched] = await enrichOrdersWithProcessedBy([order.toObject()]);
+      return sendSuccess(enriched, "Online order approved");
+    }
+
+    if (action === "mark-online-ready") {
+      const order = await Order.findOne({
+        _id: orderId,
+        restaurantId,
+        isActive: { $ne: false },
+      });
+      if (!order) {
+        return sendError(new Error("Not Found"), "Order not found", 404);
+      }
+      if (order.source !== "ONLINE") {
+        return sendError(new Error("Invalid source"), "Only online orders support this action", 400);
+      }
+      if (order.status !== "CONFIRMED" && order.status !== "COMPLETED") {
+        return sendError(
+          new Error("Not ready"),
+          "Approve and send KOT before marking ready for pickup",
+          400
+        );
+      }
+      if (!order.onlineKotSentAt) {
+        return sendError(
+          new Error("KOT required"),
+          "Create the kitchen ticket before marking ready for pickup",
+          400
+        );
+      }
+      if (order.onlineReadyAt || order.status === "COMPLETED") {
+        return sendError(new Error("Already ready"), "Order was already marked ready", 400);
+      }
+
+      order.status = "COMPLETED";
+      order.onlineReadyAt = new Date();
+      order.onlineReadyBy = employeeId;
+      await order.save();
+
+      try {
+        const restaurant = await Restaurant.findById(restaurantId)
+          .select("name address slug")
+          .lean();
+        const profile = restaurant?.slug
+          ? await getPublicRestaurantProfile(restaurant.slug)
+          : null;
+        await sendOnlineOrderStatusEmail({
+          type: "ready",
+          order,
+          restaurantName: profile?.name || restaurant?.name,
+          address: profile?.address || restaurant?.address || null,
+          phone: profile?.phone || null,
+          phoneCode: profile?.phoneCode || null,
+          phoneDisplay: profile?.phoneDisplay || null,
+        });
+      } catch (emailErr) {
+        logger.error("Failed to send online ready email", emailErr);
+      }
+
+      try {
+        const io = getSocketServer();
+        io?.to(`restaurant:${restaurantId}`).emit("order:updated", {
+          orderId: order._id,
+          orderNumber: order.orderNumber,
+          source: "ONLINE",
+          status: "COMPLETED",
+          onlineReady: true,
+        });
+      } catch (socketErr) {
+        logger.error("Failed to emit online ready socket", socketErr);
+      }
+
+      const [enriched] = await enrichOrdersWithProcessedBy([order.toObject()]);
+      return sendSuccess(enriched, "Order marked ready for pickup");
+    }
+
+    if (action === "send-online-kot") {
+      const order = await Order.findOne({
+        _id: orderId,
+        restaurantId,
+        isActive: { $ne: false },
+      });
+      if (!order) {
+        return sendError(new Error("Not Found"), "Order not found", 404);
+      }
+      if (order.source !== "ONLINE") {
+        return sendError(new Error("Invalid source"), "Only online orders support this KOT action", 400);
+      }
+      if (order.status !== "CONFIRMED") {
+        return sendError(
+          new Error("Not approved"),
+          "Approve the online order before sending KOT",
+          400
+        );
+      }
+      if (order.onlineKotSentAt) {
+        return sendError(new Error("Already sent"), "Kitchen ticket was already sent for this order", 400);
+      }
+
+      const kitchenItems = (order.items || []).filter(
+        (item) => String(item.productType || "KITCHEN").toUpperCase() !== "BAR"
+      );
+      const ticketItems = kitchenItems.length > 0 ? kitchenItems : order.items || [];
+
+      const { job } = await enqueueOrderTicketPrintJob({
+        order,
+        employeeId,
+        guestCount: order.guestCount,
+        ticketItems,
+        routeToKitchen: true,
+      });
+
+      if (!job) {
+        return sendError(
+          new Error("Print failed"),
+          "Could not create kitchen ticket. Check printer setup and try again.",
+          502
+        );
+      }
+
+      order.onlineKotSentAt = new Date();
+      order.onlineKotSentBy = employeeId;
+      await order.save();
+
+      try {
+        const io = getSocketServer();
+        io?.to(`restaurant:${restaurantId}`).emit("order:updated", {
+          orderId: order._id,
+          orderNumber: order.orderNumber,
+          source: "ONLINE",
+          onlineKotSent: true,
+        });
+      } catch (socketErr) {
+        logger.error("Failed to emit online KOT socket", socketErr);
+      }
+
+      const [enriched] = await enrichOrdersWithProcessedBy([order.toObject()]);
+      return sendSuccess(
+        { ...enriched, kotJobId: job._id },
+        "Kitchen ticket created"
+      );
+    }
+
+    if (action !== "waive") {
+      return sendError(new Error("Invalid action"), "Unsupported action", 400);
+    }
+
+    const waiveReason = String(reason || "").trim();
+    if (!waiveReason) {
+      return sendError(new Error("Missing reason"), "A waive reason is required", 400);
+    }
+
+    const order = await Order.findOne({
+      _id: orderId,
+      restaurantId,
+      isActive: { $ne: false },
+    });
+    if (!order) {
+      return sendError(new Error("Not Found"), "Order not found", 404);
+    }
+
+    if (order.paymentStatus === "PAID" || order.status === "PAID") {
+      return sendError(new Error("Already Paid"), "Cannot waive a paid order", 400);
+    }
+
+    if (["WAIVED", "CANCELLED"].includes(order.status)) {
+      return sendError(new Error("Already Closed"), `Order is already ${order.status}`, 400);
+    }
+
+    if (!["PENDING", "CONFIRMED"].includes(order.status)) {
+      return sendError(new Error("Invalid Status"), "Only pending or confirmed orders can be waived", 400);
+    }
+
+    order.status = "WAIVED";
+    order.waiveReason = waiveReason;
+    order.waivedAt = new Date();
+    order.waivedBy = employeeId;
+    await order.save();
+
+    let sessionReleased = false;
+    if (order.tableSession) {
+      const session = await TableSession.findOne({
+        _id: order.tableSession,
+        restaurant: restaurantId,
+      });
+
+      if (session?.isSessionOpen) {
+        const blockingOrders = await Order.countDocuments({
+          _id: { $in: session.activeOrders },
+          isActive: { $ne: false },
+          paymentStatus: { $ne: "PAID" },
+          status: { $nin: ["CANCELLED", "WAIVED"] },
+        });
+
+        if (blockingOrders === 0) {
+          session.status = "RELEASED";
+          session.isSessionOpen = false;
+          session.closedAt = new Date();
+          await session.save();
+
+          const releasedIds = await freeSessionTables(session);
+
+          sessionReleased = true;
+
+          try {
+            await OperationalAuditLog.create({
+              restaurantId,
+              actorId,
+              actorType: actor.actorType,
+              actorName: actor.actorName,
+              action: "TABLE_RELEASED",
+              floorId: session.floor,
+              tableId: session.primaryTable,
+              tableSessionId: session._id,
+              reason: waiveReason,
+            });
+          } catch (auditErr) {
+            logger.error("Failed to write waive table-release audit log", auditErr);
+          }
+
+          if (global.io) {
+            global.io.to(`floor:${session.floor}`).emit("table:released", {
+              sessionId: session._id,
+              tableId: session.primaryTable,
+              tableIds: releasedIds,
+            });
+          }
+
+          try {
+            const releasedTables = await Table.find({ _id: { $in: releasedIds } })
+              .select("tableNumber")
+              .lean();
+            const releasedLabel = joinTableNumbers(
+              releasedTables.map((t) => t.tableNumber),
+            );
+            await createNotification({
+              restaurantId,
+              type: "TABLE_RELEASED",
+              title: "Table Released",
+              message: `Table ${releasedLabel || ""} was released after bill waive`,
+              tableId: session.primaryTable,
+              tableSessionId: session._id,
+              employeeId,
+              floorId: session.floor,
+              priority: "low",
+              metadata: { tableNo: releasedLabel || null, waivedOrderId: order._id },
+            });
+          } catch (notifErr) {
+            logger.error("Failed to create TABLE_RELEASED notification after waive", notifErr);
+          }
+        }
+      }
+    }
+
+    try {
+      await OperationalAuditLog.create({
+        restaurantId,
+        actorId,
+        actorType: actor.actorType,
+        actorName: actor.actorName,
+        action: "ORDER_CANCELLED",
+        floorId: order.floor,
+        tableId: order.table,
+        tableSessionId: order.tableSession,
+        reason: waiveReason,
+        newValue: { status: "WAIVED", orderId: order._id, orderNumber: order.orderNumber },
+      });
+    } catch (auditErr) {
+      logger.error("Failed to write waive order audit log", auditErr);
+    }
+
+    logger.info(`Order ${order.orderNumber} waived by Employee ${employeeId}: ${waiveReason}`);
+
+    const [enriched] = await enrichOrdersWithProcessedBy([order.toObject()]);
+    return sendSuccess(
+      { ...enriched, sessionReleased },
+      sessionReleased ? "Bill waived and table released" : "Bill waived successfully"
+    );
+  } catch (error) {
+    logger.error("Failed to patch order", error);
+    return sendError(error, "Failed to update order", 500);
+  }
+}, ["EMPLOYEE", "MANAGER", "ADMIN", "SERVER", "BARTENDER", "STAFF"]);

@@ -1,0 +1,106 @@
+import { AuthRepository } from '@/repositories/AuthRepository';
+import { comparePassword, hashPassword } from '@/utils/password';
+import { signToken } from '@/utils/jwt';
+import { setCookie, deleteCookie } from '@/utils/cookies';
+
+export class AuthService {
+  constructor() {
+    this.authRepo = new AuthRepository();
+  }
+
+  async adminLogin(email, password) {
+    const admin = await this.authRepo.findAdminByEmail(email);
+    if (!admin) throw new Error('Invalid credentials');
+
+    if (admin.status === 'Inactive') {
+      throw new Error('Account is inactive. Please contact your administrator.');
+    }
+
+    if (admin.isVerified === false) {
+      throw new Error('Account is pending verification. Please contact a super admin.');
+    }
+
+    const isMatch = await comparePassword(password, admin.password);
+    if (!isMatch) throw new Error('Invalid credentials');
+
+    // Auto-migrate legacy 'ADMIN' to 'Super Admin'
+    let currentRole = admin.role;
+    if (currentRole === 'ADMIN') {
+      currentRole = 'Super Admin';
+      await this.authRepo.updateAdmin(admin._id, { role: 'Super Admin', lastLogin: new Date() });
+    } else {
+      await this.authRepo.updateAdmin(admin._id, { lastLogin: new Date() });
+    }
+
+    const token = await signToken({
+      userId: admin._id.toString(),
+      restaurantId: admin.restaurantId ? admin.restaurantId.toString() : null,
+      role: currentRole,
+    });
+
+    return { token, user: { id: admin._id.toString(), email: admin.email, role: currentRole, name: admin.name } };
+  }
+
+  async employeeLogin(email, password) {
+    const employee = await this.authRepo.findEmployeeByEmail(email);
+    if (!employee || !employee.isActive) throw new Error('Invalid credentials or inactive account');
+
+    const isMatch = await comparePassword(password, employee.password);
+    if (!isMatch) throw new Error('Invalid credentials');
+
+    const token = await signToken({
+      userId: employee._id.toString(),
+      restaurantId: employee.restaurantId ? employee.restaurantId.toString() : null,
+      role: employee.role,
+    });
+
+    return { token, user: { id: employee._id.toString(), email: employee.email, role: employee.role } };
+  }
+
+  async getCurrentUser(userId, role, options = {}) {
+    const { tokenType, employeeId } = options;
+
+    // Sales clock-in JWT (employee_access_token) — role can be "Admin"
+    // but the record lives in the Employee collection, not POS Admin.
+    if (tokenType === 'access' || employeeId) {
+      return await this.authRepo.findEmployeeById(userId);
+    }
+
+    const isPosAdminRole = role === 'ADMIN' || role === 'Super Admin' || role === 'Admin';
+    if (isPosAdminRole) {
+      const admin = await this.authRepo.findAdminById(userId);
+      if (admin) return admin;
+      return await this.authRepo.findEmployeeById(userId);
+    }
+
+    return await this.authRepo.findEmployeeById(userId);
+  }
+
+  async changePassword(userId, role, currentPassword, newPassword) {
+    let user = role === 'ADMIN' 
+      ? await this.authRepo.findAdminById(userId) 
+      : await this.authRepo.findEmployeeById(userId);
+
+    // Fetch full document with password for comparison
+    if (role === 'ADMIN') {
+      user = await this.authRepo.findAdminByEmail(user.email);
+    } else {
+      user = await this.authRepo.findEmployeeByEmail(user.email);
+    }
+
+    if (!user) throw new Error('User not found');
+
+    const isMatch = await comparePassword(currentPassword, user.password);
+    if (!isMatch) throw new Error('Incorrect current password');
+
+    const hashedNew = await hashPassword(newPassword);
+
+    if (role === 'ADMIN') {
+      await this.authRepo.updateAdminPassword(userId, hashedNew);
+    } else {
+      await this.authRepo.updateEmployeePassword(userId, hashedNew);
+    }
+
+    return true;
+  }
+}

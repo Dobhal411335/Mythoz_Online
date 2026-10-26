@@ -1,0 +1,72 @@
+import mongoose from 'mongoose';
+
+const ChoiceOptionSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  subChoices: [{ type: String, trim: true }],
+});
+
+const VariantSchema = new mongoose.Schema({
+  size: { type: String, required: true },
+  price: { type: Number, required: true },
+  status: { type: Boolean, default: true },
+  ingredients: { type: [String], default: [] },
+  choiceOptions: { type: [ChoiceOptionSchema], default: [] },
+});
+
+/** Custom data: group name → flat option strings (radio single-select at order time) */
+const CustomDataSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  subChoices: [{ type: String, trim: true }],
+});
+
+const AddonSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  price: { type: Number, required: true },
+  size: { type: String, default: 'Regular' },
+  status: { type: Boolean, default: true },
+  choiceOptions: { type: [ChoiceOptionSchema], default: [] },
+  ingredients: { type: [String], default: [] },
+});
+
+const ProductSchema = new mongoose.Schema(
+  {
+    restaurant: { type: mongoose.Schema.Types.ObjectId, ref: 'Restaurant', required: true },
+    category: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', required: true },
+    name: { type: String, required: true, trim: true },
+    productCode: { type: String, trim: true, default: '' },
+    productType: {
+      type: String,
+      enum: ['KITCHEN', 'BAR'],
+      default: 'KITCHEN',
+      required: true,
+    },
+    description: { type: String, trim: true, default: '' },
+    taxes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Tax' }],
+    taxData: {
+      totalPercentage: { type: Number, default: 0 },
+      totalFixed: { type: Number, default: 0 },
+      taxNames: [{ type: String }]
+    },
+    status: { type: String, enum: ['Active', 'Inactive'], default: 'Active' },
+    discount: { type: mongoose.Schema.Types.ObjectId, ref: 'Coupon' },
+    discountActive: { type: Boolean, default: true },
+    /** Online / public menu image */
+    image: { url: { type: String }, key: { type: String } },
+    /** Sales POS create-order image (separate from online) */
+    salesImage: { url: { type: String }, key: { type: String } },
+    variants: [VariantSchema],
+    addons: [AddonSchema],
+    customData: [CustomDataSchema],
+    choiceOptions: [ChoiceOptionSchema],
+    preparationStyles: [{ type: String }],
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
+  },
+  { timestamps: true }
+);
+
+ProductSchema.index({ restaurant: 1, status: 1, category: 1 });
+ProductSchema.index({ restaurant: 1, category: 1 });
+ProductSchema.index({ restaurant: 1, name: 1 });
+
+export default mongoose.models.Product || mongoose.model('Product', ProductSchema);

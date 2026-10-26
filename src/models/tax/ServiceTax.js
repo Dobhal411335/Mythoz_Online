@@ -1,0 +1,18 @@
+import mongoose from 'mongoose';
+
+const ServiceTaxSchema = new mongoose.Schema(
+  {
+    restaurant: { type: mongoose.Schema.Types.ObjectId, ref: 'Restaurant', required: true },
+    name: { type: String, required: true, trim: true },
+    value: { type: Number, required: true },
+    type: { type: String, enum: ['Amount', 'Percent'], required: true },
+    status: { type: String, enum: ['Active', 'Inactive'], default: 'Active' },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Employee' },
+  },
+  { timestamps: true }
+);
+
+ServiceTaxSchema.index({ restaurant: 1, status: 1 });
+
+export default mongoose.models.ServiceTax || mongoose.model('ServiceTax', ServiceTaxSchema);

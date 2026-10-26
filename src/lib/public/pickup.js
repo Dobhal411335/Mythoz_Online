@@ -1,0 +1,310 @@
+import { getRestaurantTimezone } from "@/lib/restaurantTime";
+
+/**
+ * Pickup / online ordering wall clock — same env as EOD / Today.
+ *   Production (Canada): America/Toronto
+ *   Local testing (India): Asia/Kolkata via .env.local
+ */
+export function onlineOrderingTimezone() {
+  return getRestaurantTimezone();
+}
+
+/**
+ * Same-day pickup slots: every 15 minutes, starting ~leadMinutes from now,
+ * until close (default 22:45) restaurant-local.
+ * For 24h restaurants, if nothing is left today, continue into the next day.
+ * @param {Date} [now]
+ * @param {string} [timeZone]
+ * @param {{ leadMinutes?: number, openMinutes?: number, endMinutes?: number, is24Hours?: boolean }} [options]
+ */
+export function buildSameDayPickupSlots(
+  now = new Date(),
+  timeZone = onlineOrderingTimezone(),
+  options = {}
+) {
+  const leadMinutes = Number.isFinite(options.leadMinutes)
+    ? options.leadMinutes
+    : 30;
+  const is24Hours = Boolean(options.is24Hours);
+  const local = getLocalParts(now, timeZone);
+  const slots = [];
+  const nowPlusLead = local.hour * 60 + local.minute + leadMinutes;
+  const openFloor = Number.isFinite(options.openMinutes)
+    ? Math.max(0, Number(options.openMinutes))
+    : 0;
+  const startMinutes = Math.max(nowPlusLead, openFloor);
+  const aligned = Math.ceil(startMinutes / 15) * 15;
+  // Default last slot 10:45 PM; can be overridden by restaurant close time.
+  const endMinutes = Number.isFinite(options.endMinutes)
+    ? Math.min(23 * 60 + 45, Math.max(0, Number(options.endMinutes)))
+    : is24Hours
+      ? 23 * 60 + 45
+      : 22 * 60 + 45;
+
+  const pushRange = (dayParts, fromMin, toMin) => {
+    for (let m = fromMin; m <= toMin; m += 15) {
+      const hours = Math.floor(m / 60);
+      const minutes = m % 60;
+      if (hours > 23) break;
+      if (hours < 0) continue;
+      const label = formatSlotLabel(hours, minutes);
+      const value = `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+      const dateStr = `${dayParts.year}-${String(dayParts.month).padStart(2, "0")}-${String(dayParts.day).padStart(2, "0")}`;
+      slots.push({
+        value,
+        label: is24Hours && dayParts !== local ? `${label} (next day)` : label,
+        isoLocal: `${dateStr} ${value}`,
+        date: dateStr,
+      });
+    }
+  };
+
+  if (aligned <= endMinutes) {
+    pushRange(local, aligned, endMinutes);
+  }
+
+  // 24h open: never show "closed" just because today's grid ran out (late night).
+  if (slots.length === 0 && is24Hours) {
+    const next = addLocalDays(local, 1);
+    const nextStart = Math.max(openFloor, Math.ceil(leadMinutes / 15) * 15);
+    pushRange(next, nextStart, endMinutes);
+  }
+
+  return slots;
+}
+
+function addLocalDays(parts, days) {
+  const utc = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+  utc.setUTCDate(utc.getUTCDate() + days);
+  return {
+    year: utc.getUTCFullYear(),
+    month: utc.getUTCMonth() + 1,
+    day: utc.getUTCDate(),
+    hour: 0,
+    minute: 0,
+    second: 0,
+  };
+}
+
+/**
+ * Accept a pickup time that was (or still is) offerable to the guest.
+ *
+ * Checks both:
+ *   - 5-minute lead (OTP / checkout grace — slot stays valid after delay)
+ *   - 30-minute lead (what the UI dropdown uses)
+ *
+ * That dual check matters for 24h restaurants late at night: a 30-min lead
+ * rolls to next-day slots (00:00…), while a 5-min lead may still list tonight
+ * (23:30…). Matching only the 5-min grid wrongly rejected next-day picks.
+ */
+export function isValidSameDayPickup(
+  pickupTime,
+  now = new Date(),
+  timeZone = onlineOrderingTimezone(),
+  options = {}
+) {
+  const normalized = normalizePickupTime(pickupTime);
+  if (!normalized) return false;
+
+  const base = {
+    openMinutes: options.openMinutes,
+    endMinutes: options.endMinutes,
+    is24Hours: options.is24Hours,
+  };
+
+  for (const leadMinutes of [5, 30]) {
+    const acceptable = buildSameDayPickupSlots(now, timeZone, {
+      ...base,
+      leadMinutes,
+    });
+    if (acceptable.some((s) => s.value === normalized)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Build all 15-min slots for a future calendar day (no lead from "now").
+ * Used for offer-only bookings scheduled after today.
+ */
+export function buildPickupSlotsForDate(
+  dateStr,
+  timeZone = onlineOrderingTimezone(),
+  options = {}
+) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateStr || ""))) return [];
+  const [y, m, d] = String(dateStr).split("-").map(Number);
+  const openFloor = Number.isFinite(options.openMinutes)
+    ? Math.max(0, Number(options.openMinutes))
+    : 0;
+  const endMinutes = Number.isFinite(options.endMinutes)
+    ? Math.min(23 * 60 + 45, Math.max(0, Number(options.endMinutes)))
+    : options.is24Hours
+      ? 23 * 60 + 45
+      : 22 * 60 + 45;
+  const aligned = Math.ceil(openFloor / 15) * 15;
+  const slots = [];
+  for (let mins = aligned; mins <= endMinutes; mins += 15) {
+    const hours = Math.floor(mins / 60);
+    const minutes = mins % 60;
+    if (hours > 23) break;
+    const value = `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+    slots.push({
+      value,
+      label: formatSlotLabel(hours, minutes),
+      isoLocal: `${dateStr} ${value}`,
+      date: dateStr,
+    });
+  }
+  return slots;
+}
+
+/**
+ * Validate pickup HH:mm for a specific fulfillment date.
+ * Today → same-day lead rules; future → any slot in that day's grid.
+ */
+export function isValidPickupForDate(
+  pickupTime,
+  dateStr,
+  now = new Date(),
+  timeZone = onlineOrderingTimezone(),
+  options = {}
+) {
+  const normalized = normalizePickupTime(pickupTime);
+  if (!normalized || !/^\d{4}-\d{2}-\d{2}$/.test(String(dateStr || ""))) {
+    return false;
+  }
+
+  const local = getLocalParts(now, timeZone);
+  const todayStr = `${local.year}-${String(local.month).padStart(2, "0")}-${String(local.day).padStart(2, "0")}`;
+
+  if (dateStr === todayStr) {
+    return isValidSameDayPickup(pickupTime, now, timeZone, options);
+  }
+  if (dateStr < todayStr) return false;
+
+  return buildPickupSlotsForDate(dateStr, timeZone, options).some(
+    (s) => s.value === normalized,
+  );
+}
+
+export function formatPickupNotePrefixForDate(pickupTime, dateStr) {
+  const normalized = normalizePickupTime(pickupTime);
+  if (!normalized) {
+    throw Object.assign(new Error("Invalid pickup time"), { status: 400 });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateStr || ""))) {
+    throw Object.assign(new Error("Invalid pickup date"), { status: 400 });
+  }
+  return `[PICKUP ${dateStr} ${normalized}]`;
+}
+
+/**
+ * Resolve the calendar date for a pickup HH:mm (today, or next day for 24h).
+ */
+export function resolvePickupSlotDate(
+  pickupTime,
+  now = new Date(),
+  timeZone = onlineOrderingTimezone(),
+  options = {}
+) {
+  const normalized = normalizePickupTime(pickupTime);
+  if (!normalized) return null;
+
+  const local = getLocalParts(now, timeZone);
+  const todayStr = `${local.year}-${String(local.month).padStart(2, "0")}-${String(local.day).padStart(2, "0")}`;
+
+  const base = {
+    openMinutes: options.openMinutes,
+    endMinutes: options.endMinutes,
+    is24Hours: options.is24Hours,
+  };
+
+  for (const leadMinutes of [5, 30]) {
+    const slots = buildSameDayPickupSlots(now, timeZone, {
+      ...base,
+      leadMinutes,
+    });
+    const match = slots.find((s) => s.value === normalized);
+    if (match?.date) return match.date;
+  }
+
+  return todayStr;
+}
+
+export function formatPickupNotePrefix(
+  pickupTime,
+  now = new Date(),
+  timeZone = onlineOrderingTimezone(),
+  options = {}
+) {
+  const normalized = normalizePickupTime(pickupTime);
+  if (!normalized) {
+    throw Object.assign(new Error("Invalid pickup time"), { status: 400 });
+  }
+  const dateStr =
+    resolvePickupSlotDate(pickupTime, now, timeZone, options) ||
+    (() => {
+      const local = getLocalParts(now, timeZone);
+      return `${local.year}-${String(local.month).padStart(2, "0")}-${String(local.day).padStart(2, "0")}`;
+    })();
+  return `[PICKUP ${dateStr} ${normalized}]`;
+}
+
+export function parsePickupFromSpecialNote(specialNote) {
+  const m = String(specialNote || "").match(
+    /\[PICKUP\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\]/
+  );
+  if (!m) return null;
+  return { date: m[1], time: m[2] };
+}
+
+export function stripPickupPrefix(specialNote) {
+  return String(specialNote || "")
+    .replace(/\[PICKUP\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\]\s*/i, "")
+    .trim();
+}
+
+function normalizePickupTime(pickupTime) {
+  if (!pickupTime || typeof pickupTime !== "string") return null;
+  const match = pickupTime.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  if (minutes % 15 !== 0) return null;
+  // Allow full-day grid (incl. 24h restaurants up to 23:45).
+  if (hours * 60 + minutes > 23 * 60 + 45) return null;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function formatSlotLabel(hours, minutes) {
+  const period = hours >= 12 ? "PM" : "AM";
+  const h12 = hours % 12 || 12;
+  return `${h12}:${String(minutes).padStart(2, "0")} ${period}`;
+}
+
+function getLocalParts(date, timeZone) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = Object.fromEntries(
+    fmt.formatToParts(date).map((p) => [p.type, p.value])
+  );
+  const hour = parts.hour === "24" ? 0 : Number(parts.hour);
+  return {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+    hour,
+    minute: Number(parts.minute),
+    second: Number(parts.second),
+  };
+}
